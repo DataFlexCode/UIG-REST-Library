@@ -1,0 +1,1036 @@
+//==============================================================================
+// cRESTFulService.pkg
+// -------------------
+// This is a new version beased on cHttpRequestHandler which will be replaced in
+// DataFlex v19.1 and remove the need for the ASP layer.  It provides a bunch of
+// functionality which makes constructing RESTful interfaces easier.
+//
+//------------------------------------------------------------------------------
+// Date         Author  Comments
+// ----------   ------  --------------------------------------------------------
+// 03/04/2019   MJP     Added pahoInterfaces and pasInterfacePaths properties as
+//                      well as RegisterInterface, IsRegisteredPath, AutoProcess
+//                      and AddRegisteredCollections methods.
+//==============================================================================
+
+Use cWebHttpHandler.pkg
+Use CharTranslate.pkg
+Use RESTConstants.pkg
+
+Register_Function  psInterfacePath Returns String
+Register_Function  psInterfaceDesc Returns String
+Register_Procedure ProcessRequest
+Register_Function  pbIncludeInApiRoot Returns Boolean
+
+Class cRESTfulService is a cWebHttpHandler
+    
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        
+        { DesignTime=False }
+        Property String[] pasPathParts
+        { DesignTime=False }
+        Property String   psCachedBaseURL       ""
+        { DesignTime=False }
+        Property Handle   phoRequestJson
+        { DesignTime=False }
+        Property Handle[] pahoInterfaces
+        { DesignTime=False }
+        Property String[] pasInterfacePaths
+        { DesignTime=False }
+        Property Integer  piNestingDepth        0
+        { DesignTime=False }
+        Property Boolean  pbRespStatusSet       False
+        Property Boolean  pbAllowListFilters    False
+
+        // ToDo: Do not like!
+        { DesignTime=False }
+        Property String   psCachedFilter    "**NONE**"
+        
+        Property String   psApiName             "api"
+        Property Boolean  pbUseCachedBaseUrl    True
+        Property Boolean  pbReturnBinary        False
+        Property Boolean  pbVerboseErrors       False
+        
+        // Cosmetic configurability properties
+        Property String   psOwnerName       "owner"
+        Property String   psCollectionName  "collection"
+        Property String   psCollectionsName "collections"
+        Property String   psLinksName       "links"
+        Property String   psCountName       "count"
+        Property String   psHRefName        "href"
+        Property String   psNameString      "name"
+        Property Boolean  pbUseCounts       True
+        Property Boolean  pbUseOwner        True
+        Property Boolean  pbUseSelfLinks    True
+        Property Boolean  pbUseListLinks    True
+        Property Boolean  pbUseCollection   True
+        
+        Set psVerbs to "GET,POST,PATCH,DELETE"
+        
+        Object oTrans is a cCharTranslate
+        End_Object
+        
+        #Include httpstatusreasons.inc
+    End_Procedure
+    
+    // Function PathPart
+    // =================
+    // Returns the part of the path at the passed index, or an empty string
+    Function PathPart Integer iPart Returns String
+        String[] asParts
+        
+        Get pasPathParts to asParts
+        
+        If (iPart < SizeOfArray(asParts)) Begin
+            Function_Return asParts[iPart]
+        End
+        
+        Function_Return ""        
+    End_Function
+    
+    // Function EncodedPath
+    // ====================
+    // Returns the call path URL encoded
+    Function EncodedPath Returns String
+        String[] asParts
+        Integer  iLast i
+        String   sPath
+        
+        Get pasPathParts to asParts
+        Move (SizeOfArray(asParts) - 1) to iLast
+        
+        For i from 0 to iLast
+            If (sPath <> "") ;
+                Move (sPath + "/") to sPath
+            Move (sPath + UrlEncode(Self, asParts[i])) to sPath
+        Loop
+        
+        Function_Return sPath
+    End_Function
+    
+//    // Function RequestDataJson
+//    // ========================
+//    // Returns the passed data (if any) as a JSON object
+//    Function RequestDataJson Returns Handle
+//        UChar[] ucaData
+//        Handle  hoJson
+//        Boolean bOK
+//        
+//        Get RequestDataUChar 0 to ucaData
+//        
+//        If (SizeOfArray(ucaData)) Begin
+//            Get Create (RefClass(cJsonObject)) to hoJson
+//            Get ParseUtf8 of hoJson ucaData to bOK
+//            
+//            If bOK Begin
+//                Set phoRequestJson to hoJson
+//                Function_Return hoJson
+//            End
+//            Else Begin
+//                Send SetStandardResponseStatus 400
+//                Send OutputError "Invalid JSON" (psParseError(hoJson))
+//                Function_Return -1
+//            End
+//    
+//            Send Destroy of hoJson
+//        End
+//        
+//        Function_Return 0
+//    End_Function
+
+    // Function StoreRequestJson
+    // =========================
+    // Returns the passed data (if any) as a JSON object
+    Function StoreRequestJson Returns Boolean
+        UChar[] ucaData
+        Handle  hoJson
+        Boolean bOK
+        
+        Get RequestDataUChar 0 to ucaData
+        
+        If (SizeOfArray(ucaData)) Begin
+            Get Create (RefClass(cJsonObject)) to hoJson
+            Get ParseUtf8 of hoJson ucaData to bOK
+            
+            If bOK ;
+                Set phoRequestJson to hoJson
+            Else Begin
+                Send SetStandardResponseStatus 400
+                Send OutputError "Invalid JSON" (psParseError(hoJson))
+                Send Destroy of hoJson
+                Function_Return False
+            End
+    
+        End
+        
+        Function_Return True
+    End_Function
+    
+    // Procedure OutputJson
+    // ====================
+    // Outputs the JSON as UChar and destroys the passed JSON object (if non-zero).
+    // Will set the appropriate response status if that has not already been set.
+    Procedure OutputJson Handle hoJson
+        UChar[] ucaData
+        Handle  hoErrs hoErr
+        Integer iErrs i iLast
+        
+        // Get rid of the request JSON, if any
+        If (phoRequestJson(Self)) Begin
+            Send Destroy of (phoRequestJson(Self))
+            Set phoRequestJson to 0
+        End
+        
+        Send ErrorQueueEnd
+        Get ErrorCount to iErrs
+        
+        If iErrs Begin
+            Get CreateJsonArray to hoErrs
+            Move (iErrs - 1) to iLast
+
+            For i from 0 to iLast
+                Get CreateJsonObject to hoErr
+                Send SetMemberValue of hoErr "errMsg" jsonTypeString  (Value(oErrorText(ghoWebErrorHandler), i))
+                
+                If (pbVerboseErrors(Self)) Begin
+                    Send SetMemberValue of hoErr "errNum"   jsonTypeInteger (Value(oErrorNumber(ghoWebErrorHandler), i))
+                    Send SetMemberValue of hoErr "errLine"  jsonTypeInteger (Value(oLineNr(ghoWebErrorHandler), i))
+                    Send SetMemberValue of hoErr "errTable" jsonTypeInteger (Value(oFileNr(ghoWebErrorHandler), i))
+                    Send SetMemberValue of hoErr "errCol"   jsonTypeInteger (Value(oFieldNr(ghoWebErrorHandler), i))
+                End
+                
+                Send AddMember of hoErrs hoErr
+                Send Destroy of hoErr
+            Loop
+            
+            If not hoJson ;
+                Get CreateJsonObject to hoJson
+            
+            Send SetMember of hoJson "errors" hoErrs
+            Send Destroy of hoErrs
+        End
+        
+        If hoJson Begin
+            Set pbEscapeForwardSlash of hoJson to False
+            Get StringifyUtf8 of hoJson to ucaData
+            Send Destroy of hoJson
+            Send AddHttpResponseHeader "Cache-Control" "no-store"
+            
+            If (SizeOfArray(ucaData) > 2) Begin         // 2 = "{}", so empty
+                Send AddHttpResponseHeader "Content-Type" "application/json"
+                If not (pbRespStatusSet(Self)) ;
+                    Send SetStandardResponseStatus 200  // OK
+                Send OutputUChar ucaData
+            End
+            Else Begin
+                // If no other response staus has been set and there is no data
+                // to return, set the 204 - No content status. The logic may be
+                // that they are doing an update or a delete, but have requested
+                // NOT to return an instance from that, then there is nothing to
+                // return.  On a create however the status will already have
+                // been set to 
+                If not (pbRespStatusSet(Self)) ;
+                    Send SetStandardResponseStatus 204  // No content
+            End
+            
+        End
+        Else If not (pbRespStatusSet(Self)) ;
+            Send SetStandardResponseStatus 204          // No content
+        
+    End_Procedure
+    
+    // Functions CreateJsonObject and CreateJsonArray
+    // ==============================================
+    // Simple little helper functions to save a bit of code on doing these two
+    // things.
+    Function CreateJsonObject Returns Handle
+        Handle hoObj
+        
+        Get Create (RefClass(cJsonObject)) to hoObj
+        Send InitializeJsonType of hoObj jsonTypeObject
+        
+        Function_Return hoObj
+    End_Function
+    
+    Function CreateJsonArray Returns Handle
+        Handle hoArr
+        
+        Get Create (RefClass(cJsonObject)) to hoArr
+        Send InitializeJsonType of hoArr jsonTypeArray
+        
+        Function_Return hoArr
+    End_Function
+    
+    // Functions BaseURL, OriginalURL and CollectionURL
+    // ================================================
+    // BaseURL constructs the Base URL of the API of the API; OriginalURL calls
+    // BaseURL then appends psRequest (set from the ORIGINAL_REQUEST server 
+    // variable) to it; CollectionURL returns the original URL less the last
+    // element.  All of these rely on psRestDir being correctly set.
+    Function BaseURL Returns String
+        String  sHost sPort sProt sBase sURL sPath
+        Boolean bSec
+        Integer iPos
+        
+        Get psCachedBaseURL                             to sBase
+        
+        If (sBase = "" or not(pbUseCachedBaseUrl(Self))) Begin
+            Get ServerVariable "SERVER_NAME"            to sHost
+            Get ServerVariable "SERVER_PORT"            to sPort
+            Get ServerVariable "SERVER_PORT_SECURE"     to bSec
+            Get ServerVariable "URL"                    to sURL
+            
+            Get psRequestPath                           to sPath
+            
+            Move (RightPos(sPath, sURL))                to iPos
+            Move (Left(sURL, (iPos - 1)))               to sURL
+            
+            // Note: Case should not matter, but it seems that in Postman it
+            // does, so stick to lowercase for the protocol:
+            Move (If(bSec, "https", "http"))            to sProt
+            Move (sProt + "://" + sHost + ":" + ;
+                                  sPort + sURL)         to sBase
+            Set psCachedBaseURL                         to sBase
+        End
+        
+        Function_Return sBase
+    End_Function
+    
+    Function OriginalURL Returns String
+        String  sURL
+        
+        Get BaseURL to sURL
+        Move (sURL + "/" + EncodedPath(Self)) to sURL
+        
+        Function_Return sURL
+    End_Function
+    
+    Function CollectionURL Returns String
+        String  sColl
+        Integer iPos
+        
+        Get OriginalURL                 to sColl
+        Move (RightPos("/", sColl))     to iPos
+        Move (Left(sColl, (iPos - 1)))  to sColl
+        
+        Function_Return sColl
+    End_Function
+    
+    // Procedure RegisterInterface
+    // ===========================
+    // The message which cRestResourceHandler objects send to register
+    // themselves with the service in order to participate in automaticlly
+    // being invoked and listed by the service.
+    Procedure RegisterInterface Handle hoObj
+        Handle[] ahoInterfaces
+        Integer  iIdx
+        String   sPath
+        String[] asPaths
+        
+        Get pahoInterfaces to ahoInterfaces
+        Move (SearchArray(hoObj, ahoInterfaces)) to iIdx
+        
+        If (iIdx <> -1) ;
+            Procedure_Return  // Already registered
+        
+        Move (SizeOfArray(ahoInterfaces))   to iIdx
+        Get psInterfacePath of hoObj        to sPath
+        
+        If (sPath = "") Begin
+            Error 999 ("Interface path (psInterfacePath) not set for ResourceHandlerObject" * ;
+                       Name(hoObj))
+            Procedure_Return
+        End
+        
+        Move (Lowercase(sPath))             to sPath
+        Get pasInterfacePaths               to asPaths
+        Move hoObj                          to ahoInterfaces[iIdx]
+        Move sPath                          to asPaths[iIdx]
+        Set pahoInterfaces                  to ahoInterfaces
+        Set pasInterfacePaths               to asPaths
+    End_Procedure
+    
+    // Function IsRegisteredPath
+    // =========================
+    // Determines whether a top-level interface is registered with the service
+    // for automatic invocation.
+    Function IsRegisteredPath String sPath Returns Boolean
+        String[] asPaths
+        Integer  iIdx
+        
+        Get pasInterfacePaths to asPaths
+        
+        Move (SearchArray(sPath, asPaths)) to iIdx
+        Function_Return (iIdx <> -1)
+    End_Function
+    
+    // Procedure AutoProcess
+    // =====================
+    // Invokes ProcessRequest on top level interfaces
+    Procedure AutoProcess String sPath
+        String[] asPaths
+        Integer  iIdx
+        Handle[] ahoInterfaces
+        
+        Get pasInterfacePaths to asPaths
+        
+        Move (SearchArray(sPath, asPaths)) to iIdx
+        
+        If (iIdx = -1) Begin  // Not registered
+            Send UnrecognisedOperation
+            Procedure_Return
+        End
+        
+        Get pahoInterfaces to ahoInterfaces
+        Send ProcessRequest to ahoInterfaces[iIdx]
+    End_Procedure
+    
+    // Procedure AddRegisteredCollections
+    // ==================================
+    // Adds links to registered top level collections into API root
+    Procedure AddRegisteredCollections Handle hoResp
+        Handle[] ahoInterfaces
+        Integer  iLast i
+        String   sPath sDesc
+        Boolean  bInc
+        Handle   hoObj
+        
+        Get pahoInterfaces to ahoInterfaces
+        Move (SizeOfArray(ahoInterfaces) - 1) to iLast
+        
+        For i From 0 to iLast
+            Move ahoInterfaces[i] to hoObj
+            Get pbIncludeInAPIRoot of hoObj to bInc
+            
+            If bInc Begin
+                Get psInterfacePath of hoObj to sPath
+                Get psInterfaceDesc of hoObj to sDesc
+                If (sDesc = "") ;
+                    Move sPath to sDesc                
+                Send AddCollection hoResp sDesc (BaseURL(Self) + "/" + sPath)
+            End
+            
+        Loop
+        
+    End_Procedure
+    
+    // Procedure SetHRef
+    // =================
+    // Adds an hypertext reference to a JSON object
+    Procedure SetHRef Handle hoObj String sHRef
+        If (sHRef = "") ;
+            Send SetMemberValue of hoObj (psHRefName(Self)) jsonTypeNull       
+        Else ;
+            Send SetMemberValue of hoObj (psHRefName(Self)) jsonTypeString sHRef
+    End_Procedure
+
+    // Procedure AddCollection
+    // =======================
+    // Will add a collection to the "collections" array of the passed object
+    // (and will create that if there is not one) with name and href
+    // elements from the passed sName and sHref.
+    Procedure AddCollection Handle hoObj String sName String sHref
+        Handle   hoColls hoColl
+        
+        If (HasMember(hoObj, psCollectionsName(Self))) Begin
+            Get Member of hoObj (psCollectionsName(Self)) to hoColls
+        End
+        Else Begin
+            Get CreateJsonArray to hoColls
+        End
+        
+        Get CreateJsonObject to hoColl
+        Send SetMemberValue of hoColl (psNameString(Self)) jsonTypeString sName
+        Send SetMemberValue of hoColl (psHRefName(Self))   jsonTypeString sHref
+        Send AddMember of hoColls hoColl
+        Send Destroy of hoColl
+        Send SetMember of hoObj (psCollectionsName(Self)) hoColls
+        Send Destroy of hoColls
+    End_Procedure
+    
+    // Procedure SetCollection
+    // =======================
+    // Will add an "owning" collection element named "collection" to the
+    // passed object with a name and href as passed in sName and sHref.
+    Procedure SetCollection Handle hoObj String sName String sHref
+        Handle    hoColl
+        
+        Get CreateJsonObject to hoColl
+        Send SetMemberValue of hoColl (psNameString(Self)) jsonTypeString sName
+        Send SetMemberValue of hoColl (psHRefName(Self))   jsonTypeString sHref
+        Send SetMember of hoObj (psCollectionName(Self)) hoColl
+        Send Destroy of hoColl
+    End_Procedure
+
+    // Procedure AddLink
+    // =================
+    // Will add a link to the "links" array of the passed object (and create that
+    // if it doesn't already have one) containing an elemnt called what is passed
+    // in sName with a value passed in sValue and an href element with what was 
+    // passed in sHref.
+    Procedure AddLink Handle hoObj String sName String sValue String sHref
+        Handle   hoLinks hoLink
+        
+        If (HasMember(hoObj, psLinksName(Self))) Begin
+            Get Member of hoObj (psLinksName(Self)) to hoLinks
+        End
+        Else Begin
+            Get CreateJsonArray to hoLinks
+        End
+        
+        Get CreateJsonObject to hoLink
+        Send SetMemberValue of hoLink sName              jsonTypeString sValue
+        Send SetMemberValue of hoLink (psHRefName(Self)) jsonTypeString sHref
+        Send AddMember of hoLinks hoLink
+        Send Destroy of hoLink
+        Send SetMember of hoObj (psLinksName(Self)) hoLinks
+        Send Destroy of hoLinks
+    End_Procedure
+    
+    // Function HttpErrStandardReason
+    // ==============================
+    // Returns the standard response text for any given HTTP response code.
+    // Relies on pasReasons being defined, which it is in the include file
+    // httpstatusreasons.inc, which is #INCLUDEd in Construct_Object.
+    Function HttpErrStandardReason UShort usCode Returns String
+        String[] asReasons
+        
+        Get pasReasons to asReasons
+        
+        If (usCode < SizeOfArray(asReasons)) ;
+            Function_Return asReasons[usCode]
+            
+        Function_Return ""
+    End_Function
+    
+    // Procedure SetStandardResponseStatus
+    // ===================================
+    // Provides a simple way of setting the response status to the standard
+    // text for any given HTTP response code
+    Procedure SetStandardResponseStatus UShort usStatusCode
+        String  sStat sReason
+
+        Move (HttpErrStandardReason(Self, usStatusCode)) to sReason
+        Send SetResponseStatus usStatusCode sReason 0
+        Set  pbRespStatusSet to True
+    End_Procedure
+    
+    // Simply sets a 400 Bad Request 
+    Procedure InvalidRequest
+        Send SetStandardResponseStatus 400
+    End_Procedure
+    
+    // Will set the JSON to be output to a passed error
+    Procedure OutputError String sReason String sDesc
+        Handle  hoJson
+        
+        Get CreateJsonObject to hoJson
+        Send SetMemberValue of hoJson sReason jsonTypeString sDesc
+        Send OutputJson hoJson
+    End_Procedure
+    
+    // To be called if authorization of a request fails
+    Procedure Unauthorized String sReason UShort usSubCode
+        Send SetStandardResponseStatus 401 //usSubCode
+        Send OutputError "Unauthorized" sReason
+    End_Procedure
+    
+    // To be called if the Verb is not allowed on that resource
+    Procedure NotAllowed
+        Send SetStandardResponseStatus 405
+        Send OutputError "Method not allowed" ;
+            ("The method '" + psRequestVerb(Self) + "' is not allowed on this resource")
+    End_Procedure
+    
+    // To be called if the requested resource was not found
+    Procedure NotFound
+        Send SetStandardResponseStatus 404
+        Send OutputError "Not found" ("The resource" * OriginalURL(Self) * "was not found")
+    End_Procedure
+    
+    // To be called if the requested resource and verb can't be handled
+    Procedure UnrecognisedOperation
+        String  sMeth sPath
+        
+        Get psRequestVerb to sMeth
+        Get psRequestPath to sPath
+        
+        Send SetStandardResponseStatus 400
+        Send OutputError "Unrecognised" ;
+                         ("The combination of the verb" * sMeth * ;
+                         "and the resource '" + sPath + "' was not recognised")
+    End_Procedure
+    
+    // To be called if a create/update/delete operation fails
+    Procedure UpdateError Integer iMode
+        String  sDesc
+        
+        Send SetStandardResponseStatus 500
+        
+        If (iMode = C_restModeCreate) ;
+            Move ("Could not create resource in" * OriginalURL(Self))   to sDesc
+        Else If (iMode = C_restModeUpdate) ;
+            Move ("Could not update resource" * OriginalURL(Self))      to sDesc
+        Else If (iMode = C_restModeDelete) ;
+            Move ("Could not delete resource" * OriginalURL(Self))      to sDesc
+
+        Send OutputError "Update failed" sDesc
+    End_Procedure
+    
+    // To be called if the passed JSON contained no changes
+    Procedure NothingToUpdate
+        Send OutputError "NothingToUpdate" ;
+            ("The request JSON did not apply any changes to the resource" * OriginalURL(Self))
+    End_Procedure
+
+    // Procedure NoJson
+    // ================
+    // Useful as a one-liner to return for when JSON data was expected but not
+    // supplied in the call
+    Procedure NoJson Returns Integer
+        Send SetStandardResponseStatus 400
+        Send OutputError "NoJSON" "No JSON was passed in the request"
+    End_Procedure
+        
+    // Function BasicAuthCredentials
+    // =============================
+    // Will attempt to get the HTTP Authorization header, then determine if that
+    // starts with the string "BASIC ".  If so it will strip that off and
+    // base64decode the remainder.  Then it will attempt to split that string
+    // on the ":" character into a UserName and Password, returning those in
+    // a tBasicAuthCredentials struct variable.
+    // See RFC 7617: https://tools.ietf.org/html/rfc7617
+    Function BasicAuthCredentials Returns tBasicAuthCredentials
+        String   sCreds
+        String[] asCreds
+        Integer  iLen
+        Address  pAddr
+        Boolean  bOK
+        tBasicAuthCredentials tCreds
+        
+        Get HttpRequestHeader "Authorization" to sCreds
+        
+        If (Left(Uppercase(sCreds), Length(C_authBasic)) = ;
+                                            C_authBasic) Begin
+            Move (Right(sCreds, (Length(sCreds) - ;
+                                   Length(C_authBasic))))   to sCreds
+            
+            Move (Length(sCreds)) to iLen
+            Move (Base64Decode(AddressOf(sCreds), &iLen))   to pAddr
+            Move (Repeat(Character(0), iLen)) to sCreds
+            Move (MemCopy(AddressOf(sCreds), pAddr, iLen))  to bOK
+            Move (Free(pAddr)) to bOK
+
+            Move (StrSplitToArray(sCreds, ":"))             to asCreds
+            
+            If (SizeOfArray(asCreds) = 2) Begin
+                Move (Trim(asCreds[0])) to tCreds.sUserName
+                Move (Trim(asCreds[1])) to tCreds.sPassword
+            End
+            
+        End
+        
+        Function_Return tCreds
+    End_Function
+    
+    // Procedure BasicAuthRequired
+    // ===========================
+    // The response to send if BasicAuth (UserName/Password) is required but not
+    // satisfied - browsers will then request the user enter those.  The "Realm"
+    // can be anything, but should pertain to the application.  Typically it will
+    // appear in the browser's prompt for those credentials.
+    Procedure BasicAuthRequired String sRealm
+        Send AddHttpResponseHeader "WWW-Authenticate" ('Basic realm="' + sRealm + '"')
+        Send Unauthorized "Credentials required"
+    End_Procedure
+    
+    // Function UrlEncode
+    // ==================
+    // UrlEncodes the passed string
+    Function UrlEncode String sValue Returns String
+        Move (Replaces("%", sValue, "%25")) to sValue
+        Move (Replaces(" ", sValue, "%20")) to sValue
+        Move (Replaces("!", sValue, "%21")) to sValue
+        Move (Replaces('"', sValue, "%22")) to sValue
+        Move (Replaces("#", sValue, "%23")) to sValue
+        Move (Replaces("$", sValue, "%24")) to sValue
+        Move (Replaces("&", sValue, "%26")) to sValue
+        Move (Replaces("'", sValue, "%27")) to sValue
+        Move (Replaces("(", sValue, "%28")) to sValue
+        Move (Replaces(")", sValue, "%29")) to sValue
+        Move (Replaces("*", sValue, "%2A")) to sValue
+        Move (Replaces("+", sValue, "%2B")) to sValue
+        Move (Replaces(",", sValue, "%2C")) to sValue
+        Move (Replaces("-", sValue, "%2D")) to sValue
+        Move (Replaces(".", sValue, "%2E")) to sValue
+        Move (Replaces("/", sValue, "%2F")) to sValue
+        Move (Replaces(":", sValue, "%3A")) to sValue
+        Move (Replaces(";", sValue, "%3B")) to sValue
+        Move (Replaces("<", sValue, "%3C")) to sValue
+        Move (Replaces("=", sValue, "%3D")) to sValue
+        Move (Replaces(">", sValue, "%3E")) to sValue
+        Move (Replaces("?", sValue, "%3F")) to sValue
+        Move (Replaces("@", sValue, "%40")) to sValue
+        Move (Replaces("[", sValue, "%5B")) to sValue
+        Move (Replaces("\", sValue, "%5C")) to sValue
+        Move (Replaces("]", sValue, "%5D")) to sValue
+        Move (Replaces("^", sValue, "%5E")) to sValue
+        Move (Replaces("_", sValue, "%5F")) to sValue
+        Move (Replaces("`", sValue, "%60")) to sValue
+        Move (Replaces("{", sValue, "%7B")) to sValue
+        Move (Replaces("|", sValue, "%7C")) to sValue
+        Move (Replaces("}", sValue, "%7D")) to sValue
+        Move (Replaces("~", sValue, "%7E")) to sValue
+        Function_Return sValue
+    End_Function
+    
+    // Function UrlDecode
+    // ==================
+    // UrlDecodes the passed string
+    Function UrlDecode String sValue Returns String
+        Move (Replaces("%20", sValue, " ")) to sValue
+        Move (Replaces("%21", sValue, "!")) to sValue
+        Move (Replaces("%22", sValue, '"')) to sValue
+        Move (Replaces("%23", sValue, "#")) to sValue
+        Move (Replaces("%24", sValue, "$")) to sValue
+        Move (Replaces("%25", sValue, "%")) to sValue
+        Move (Replaces("%26", sValue, "&")) to sValue
+        Move (Replaces("%27", sValue, "'")) to sValue
+        Move (Replaces("%28", sValue, "(")) to sValue
+        Move (Replaces("%29", sValue, ")")) to sValue
+        Move (Replaces("%2A", sValue, "*")) to sValue
+        Move (Replaces("%2B", sValue, "+")) to sValue
+        Move (Replaces("%2C", sValue, ",")) to sValue
+        Move (Replaces("%2D", sValue, "-")) to sValue
+        Move (Replaces("%2E", sValue, ".")) to sValue
+        Move (Replaces("%2F", sValue, "/")) to sValue
+        Move (Replaces("%3A", sValue, ":")) to sValue
+        Move (Replaces("%3B", sValue, ";")) to sValue
+        Move (Replaces("%3C", sValue, "<")) to sValue
+        Move (Replaces("%3D", sValue, "=")) to sValue
+        Move (Replaces("%3E", sValue, ">")) to sValue
+        Move (Replaces("%3F", sValue, "?")) to sValue
+        Move (Replaces("%40", sValue, "@")) to sValue
+        Move (Replaces("%5B", sValue, "[")) to sValue
+        Move (Replaces("%5C", sValue, "\")) to sValue
+        Move (Replaces("%5D", sValue, "]")) to sValue
+        Move (Replaces("%5E", sValue, "^")) to sValue
+        Move (Replaces("%5F", sValue, "_")) to sValue
+        Move (Replaces("%60", sValue, "`")) to sValue
+        Move (Replaces("%7B", sValue, "{")) to sValue
+        Move (Replaces("%7C", sValue, "|")) to sValue
+        Move (Replaces("%7D", sValue, "}")) to sValue
+        Move (Replaces("%7E", sValue, "~")) to sValue
+        Function_Return sValue
+    End_Function
+    
+    // Procedure ProcessHttpRequest
+    // ============================
+    // Provides the empty hook which will be called by the augmented
+    // OnHttpRequest below, which will be the entry point for processing REST
+    // calls
+    Procedure ProcessHttpRequest String sVerb
+    End_Procedure
+    
+    // Procedure OnHttpRequest
+    // =======================
+    // Augmented here to parse the call-path into the pasPathParts array which
+    // will be used by the PathPart function and send ProcessHttpRequest.  In 
+    // addition it stores any passed JSON in the phoRequestJson property via
+    // the StoreRequestJson call.
+    //
+    // It also resets the psCachedFilter property (yuk!).
+    Procedure OnHttpRequest String sVerb String sPath String sContentType String sAcceptType Integer iSize
+        String[] asParts
+        Boolean  bOK
+        
+        Send ErrorQueueStart
+        Set  pbRespStatusSet to False
+        
+        Move (Right(sPath, (Length(sPath) - 1)))    to sPath
+        Move (StrSplitToArray(sPath, "/"))          to asParts
+        Set pasPathParts                            to asParts
+        Set psCachedFilter                          to "**NONE**"
+        
+        Forward Send OnHttpRequest sVerb sPath sContentType sAcceptType iSize
+        
+        Get StoreRequestJson to bOK
+        If not bOK ;
+            Procedure_Return
+        
+        Send ProcessHttpRequest sVerb
+    End_Procedure
+    
+// WARNING!
+// ========
+//
+// The following two functions - FilterString and MatchesFilterString - should
+// probably not be used.  I have considered simply removing them from the class,
+// however they DO work, so I am leaving them in for now with this warning.
+//
+// The reason to not use them is that they (well, actually just 
+// MatchesFilterString) impose a horrible overhead during List operations: every
+// row/record found involve calling MatchesFilterString and checking each
+// condition the invoking user has placed in the "filter" query parameter
+// against it.
+//
+// If you are using an SQL database there are much better ways (SQL Filters) of
+// doing this, so you should definitely NOT use this technique in such a case.
+//
+// If you understand this overhead, you can make your own choices regarding
+// using this mechanism.  If you don't understand it, then my advice would be to
+// simply not implement this feature.
+    
+    // Function FilterString
+    // =====================
+    // Extracts the value of the query-string parameter "filter" 
+    // (case-insensitive) and caches it for the duration of this call, returning
+    // the cached value for the remainder of the call.  Reset to "**NONE**" in
+    // OnHttpRequest above.
+    Function FilterString Returns String
+        String  sFilter sQuery sCached
+        Integer iPos
+        
+        If not (pbAllowListFilters(Self)) ;
+            Function_Return ""
+        
+        Get psCachedFilter to sCached
+        
+        If (sCached = "**NONE**") Begin
+            Get psRequestQueryString                    to sQuery
+            Move (Pos("filter=", Lowercase(sQuery)))    to iPos
+            If not iPos ;
+                Break
+            Move (Right(sQuery, (Length(sQuery) - ;
+                           iPos - (Length("filter"))))) to sFilter
+            
+            Move (Pos("&", sFilter))                    to iPos
+            If iPos ;
+                Move (Left(sFilter, iPos - 1))          to sFilter
+            Set psCachedFilter                          to sFilter
+        End
+        Else ;
+            Move sCached to sFilter
+        
+        Function_Return sFilter
+    End_Function
+    
+    // Function MatchesFilterString
+    // ============================
+    // This function takes a DD object and uses a filter string which is made
+    // up of a pipe ("|") delimited list of filters, each of which should be a
+    // field name, an operator being one of "=", "<", ">" or "~" 
+    // (meaning not-equal) and will return False if those conditions are not
+    // satisfied by the record currently in buffer.  The intent is that it can
+    // be used in a DD's OnConstrain procedure to filter the results by an
+    // arbitrary list of conditions.
+    //
+    // Example (within a Customer DD):
+    //
+    //    Procedure OnConstrain
+    //        If (FilterString(Self) <> "") Begin
+    //            Constrain Customer as (MatchesFilterString(Self, Self))
+    //        End
+    //    End_Procedure
+    //
+    // Invoking that in a call might look like:
+    //
+    //    .../customers?filter=state=NY|city~New York|balance>500
+    //
+    // which would constrain to those customers where State IS "NY" and where
+    // City IS NOT "New York" and Balance IS greater than 500.
+    //
+    // URL-encoding of the space between "New" and "York" as "%20" may be
+    // required in some situations.
+    //
+    // Field names are case-insensitive, although String values are not.
+    // 
+    // (Whew! <g>)
+    Function MatchesFilterString Handle hoDD Returns Boolean
+        String[] asTerms asTerm 
+        String   sVal sFilter
+        Number   nVal
+        DateTime dtVal
+        Date     dVal
+        Boolean  bMatch
+        Integer  i iMax iFld iType iOp
+        Handle   hTable
+        
+        Get FilterString to sFilter
+        
+        If ((sFilter = "") or not(hoDD)) Begin
+            Function_Return True
+        End
+
+        Move (UrlDecode(Self, sFilter)) to sFilter
+        
+        Get Main_File of hoDD to hTable
+        Move True to bMatch
+        
+        Move (StrSplitToArray(sFilter, "|"))    to asTerms
+        Move (SizeOfArray(asTerms) - 1)         to iMax
+        
+        For i From 0 to iMax
+            Move -1 to iOp
+            
+            If (Pos("=", asTerms[i])) ;
+                Move (EQ) to iOp
+            Else If (Pos("<", asTerms[i])) ;
+                Move (LT) to iOp
+            Else If (Pos(">", asTerms[i])) ;
+                Move (GT) to iOp
+            Else If (Pos("~", asTerms[i])) ;
+                Move (NE) to iOp
+            
+            If (iOp >= 0) Begin
+                If (iOp = EQ) ;
+                    Move (StrSplitToArray(asTerms[i], "=")) to asTerm
+                Else If (iOp = LT) ;
+                    Move (StrSplitToArray(asTerms[i], "<")) to asTerm
+                Else If (iOp = GT) ;
+                    Move (StrSplitToArray(asTerms[i], ">")) to asTerm
+                Else If (iOp = NE) ;
+                    Move (StrSplitToArray(asTerms[i], "~")) to asTerm
+                
+                Field_Map hTable asTerm[0] to iFld
+                
+                If iFld Begin
+                    Get_Attribute DF_FIELD_TYPE of hTable iFld to iType
+                    
+                    Case Begin
+                        
+                        Case (iType = DF_ASCII)
+                            Get_Field_Value hTable iFld to sVal
+                            Move (Trim(sVal))           to sVal
+                            If ((iOp = EQ) and not(sVal =  asTerm[1])) ;
+                                Move False to bMatch
+                            If ((iOp = LT) and not(sVal <  asTerm[1])) ;
+                                Move False to bMatch
+                            If ((iOp = GT) and not(sVal >  asTerm[1])) ;
+                                Move False to bMatch
+                            If ((iOp = NE) and not(sVal <> asTerm[1])) ;
+                                Move False to bMatch
+                            Case Break
+                            
+                        Case (iType = DF_BCD)
+                            Get_Field_Value hTable iFld to nVal
+                            If ((iOp = EQ) and not(nVal =  Number(asTerm[1]))) ;
+                                Move False to bMatch
+                            If ((iOp = LT) and not(nVal <  Number(asTerm[1]))) ;
+                                Move False to bMatch
+                            If ((iOp = GT) and not(nVal >  Number(asTerm[1]))) ;
+                                Move False to bMatch
+                            If ((iOp = NE) and not(nVal <> Number(asTerm[1]))) ;
+                                Move False to bMatch
+                            Case Break
+                        
+                        Case (iType = DF_DATE)
+                            Get_Field_Value hTable iFld to dVal
+                            
+                            If ((iOp = EQ) and not(dVal =  Date(asTerm[1]))) ;
+                                Move False to bMatch
+                            If ((iOp = LT) and not(dVal <  Date(asTerm[1]))) ;
+                                Move False to bMatch
+                            If ((iOp = GT) and not(dVal >  Date(asTerm[1]))) ;
+                                Move False to bMatch
+                            If ((iOp = NE) and not(dVal <> Date(asTerm[1]))) ;
+                                Move False to bMatch
+                            Case Break
+                            
+                        Case (iType = DF_DATETIME)
+                            Get_Field_Value hTable iFld to dtVal
+                            If ((iOp = EQ) and not(String(dtVal) =  asTerm[1])) ;
+                                Move False to bMatch
+                            If ((iOp = LT) and not(String(dtVal) <  asTerm[1])) ;
+                                Move False to bMatch
+                            If ((iOp = GT) and not(String(dtVal) >  asTerm[1])) ;
+                                Move False to bMatch
+                            If ((iOp = NE) and not(String(dtVal) <> asTerm[1])) ;
+                                Move False to bMatch
+                            Case Break
+                            
+                    Case End
+                    
+                End
+            
+            End
+                
+            If not bMatch ;
+                Break
+        Loop
+        
+        Function_Return bMatch
+    End_Function
+    
+    Function SQLFilterString Handle hTable Returns String
+        String   sFilter sOp sSQL
+        String[] asTerms asSQL asTerm
+        Integer  i iLast iField iType iTerm
+        
+        Get FilterString to sFilter
+        
+        If (sFilter = "") ;
+            Function_Return ""
+
+        Move (UrlDecode(Self, sFilter)) to sFilter
+        
+        Move (StrSplitToArray(sFilter, "|")) to asTerms
+        Move (SizeOfArray(asTerms) - 1) to iLast
+        
+        For i from 0 to iLast
+            Move "" to sOp
+        
+            Case Begin
+            
+                Case (Pos("=", asTerms[i]) > 0)
+                    Move "=" to sOp
+                    Move (StrSplitToArray(asTerms[i], "=")) to asTerm
+                    Case Break
+                
+                Case (Pos(">", asTerms[i]) > 0)
+                    Move ">" to sOp
+                    Move (StrSplitToArray(asTerms[i], ">")) to asTerm
+                    Case Break
+                    
+                Case (Pos("<", asTerms[i]) > 0)
+                    Move "<" to sOp
+                    Move (StrSplitToArray(asTerms[i], "<")) to asTerm
+                    Case Break
+                    
+                Case (Pos("~", asTerms[i]) > 0)
+                    Move "!=" to sOp
+                    Move (StrSplitToArray(asTerms[i], "~")) to asTerm
+                    Case Break
+                    
+            Case End
+            
+            // Check we have a valid operator:
+            If (sOp = "") ;
+                Break Begin
+            
+            // Check that we have a valid field:
+            Move -1 to iField
+            Send IgnoreError 4100
+            Field_Map hTable asTerm[0] to iField
+            Send TrapError 4100
+            
+            If (iField = -1) ;
+                Break Begin
+            
+            // Add the appropriate SQL
+            Get_Attribute DF_FIELD_TYPE of hTable iField to iType
+                
+            If (iType = DF_BCD) ;   // Use value as passed
+                Move (asTerm[0] * sOp * asTerm[1])              to asSql[iTerm]
+            Else ;                  // Single-quote value
+                Move (asTerm[0] * sOp * "'" + asTerm[1] + "'")  to asSQL[iTerm]
+            Increment iTerm
+        Loop
+        
+        Move (StrJoinFromArray(asSQL, " AND ")) to sSQL
+        
+        Function_Return sSQL
+    End_Function
+
+End_Class

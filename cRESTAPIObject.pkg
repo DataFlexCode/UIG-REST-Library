@@ -1,0 +1,1580 @@
+﻿//==============================================================================
+// cRESTApiObject.pkg
+// ------------------
+// Objects of this class should be placed inside objects of the 
+// cRESTResourceHandler class, with which they will automatically register 
+// themselves.
+//
+// They will then handle the various requests to that resource handler, through
+// their property settings and augmentation/override of the various methods:
+//  
+//  * PreProc: Get constraining records (if any) into the DD buffer - this will
+//    happen automatically for single-segment relationships, but can be
+//    overridden in more complex cases
+//  * RequiredConditions: Get required - non-constraining - records into the DD
+//    buffer for create or update
+//  * IndexFromOrder: can be provided to allow the calling application to
+//    determine the ordering of lists based on an "Order=fieldName" query
+//    parameter
+//  * SeedFieldFromOrder: can be provided to allow a calling application to
+//    determine where to start in a list via a "Start=value" query parameter;
+//    used in conjunction with a "Limit=count" query parameter to implement
+//    pagination
+//  * InstID: The key field which will be used for finding instances
+//  * SetListDefaults: The default list of fields for the collection list
+//  * PostProc: Set up any required additional elements for the returned JSON
+//
+//------------------------------------------------------------------------------
+// Date         Author  Comments
+// ----------   ------  --------------------------------------------------------
+// 11/08/2020   MJP     Refactored to centralise the return of instance data in 
+//                      order to handle that consistently and incorporated the
+//                      PostProc processing there, removing the need to Forward
+//                      Send that.  Also fixed a number of minor bugs, most
+//                      relating to that stuff being handled inconsistantly
+//                      across the different methods.
+// 20/12/2018   MJP     Added AddListColumn, AddInstanceColumn,
+//                      AddReadOnlyColumn and AddExcludeColumn to keep the
+//                      naming an usage of these methods consistent, then
+//                      removed AddInstanceFields, AddReadOnlyFields and
+//                      AddExcludeFields (but kept SetListDefaults because *I*
+//                      like to do it that way).
+//                      Changed AddFunctionColumn to _AddFunctionColumn at 
+//                      Sture's suggestion (as were the the rest of these 
+//                      changes).  
+//                      Changed pbInstanceFieldsAll to pbAllInstanceColumns.
+//                      Changed DefineAllInstanceFeilds to 
+//                      DefineAllInstaceColumns
+//                      AddAllInstanceFields to AddAllInstanceColumns
+// 17/12/2018   MJP     Refactored to use proper TableName.ColumnName instead of
+//                      string column names, again, as per Sture's suggestions; 
+//                      this change also allows for parent fields and calculated
+//                      fields to appear in lists and instances
+// 14/12/2018   MJP     Changed class name to cRESTApiObject as per Sture's
+//                      suggestions
+// **/09/2018   MJP     Moved a lot of functionality from cRESTfulService into
+//                      here where it more properly belongs I think
+// 21/08/2018   MJP     Original
+//==============================================================================
+
+Use UI
+Use cCharTranslate.pkg
+
+Define C_restProcPrefix for "__proc__"
+
+Register_Procedure AddCollection Handle hoObj String sName String sHref
+Register_Procedure AddLink Handle hoObj String sName String sValue String sHRef
+Register_Function  BaseURL Returns String
+Register_Function  UrlEncode String sValue Returns String
+
+Struct stRESTField
+    Integer iTable
+    Integer iColumn
+    Integer iDFType
+    Integer iJType
+    String  sName
+    Handle  hoObject
+    Handle  hfFunction
+End_Struct
+
+Class cRESTApiObject is a cObject
+    
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        
+        Property Handle         phoDD
+        Property Integer        piKeyColumn             1
+        Property Integer        piIndex                 1
+        Property String         psCollName
+        Property String         psInstName              "data"
+        Property stRESTField[]  patFields
+        Property Integer[]      paiDefaultListFields
+        Property Integer[]      paiDefaultInstanceFields
+        Property Integer[]      paiExcludeFields
+        Property Integer[]      paiReadOnlyFields
+        Property Boolean        pbReadOnly              False
+        Property Boolean        pbNoUpdate              False
+        Property Boolean        pbNoDelete              False
+        Property Boolean        pbDisableInstance       False
+        Property Boolean        pbAllowFieldSelection   True
+        Property Integer        piDefaultLimit          C_restDefaultLimit
+        Property Boolean        pbAllInstanceColumns    True
+        
+        Property String[]       pasUpdateProcNames
+        Property Handle[]       pahmUpdateProcedures
+        
+        Object oTrans is a cCharTranslate
+        End_Object
+        
+    End_Procedure
+    
+    Function IsSystemFileObject Returns Boolean
+        Function_Return False
+    End_Function
+    
+    Procedure End_Construct_Object
+        Integer  iTable
+        String   sFile sHomeDir sPath sOpen sField
+        String[] asFields
+        Handle   htTable
+        Boolean  bSys
+        
+        // Assertion:
+        Get Main_File of (phoDD(Self)) to htTable
+        Get_Attribute DF_FILE_IS_SYSTEM_FILE of htTable to bSys
+        
+        If (bSys and not (IsSystemFileObject(Self))) Begin
+            Error 681 ("cRESTApiObject" * ;
+                    Name(Self) + ;
+                    "'s Main_File is a system table - use cRESTApiSystemObject instead")
+        End
+        
+        // If this has not already been called by one or other of the methods, 
+        // call it now:
+        If not (SizeOfArray(patFields(Self))) ;
+                                       Send DefineColumns
+        // And this one...
+        If (pbAllInstanceColumns(Self) and ;
+            not (SizeOfArray(paiDefaultInstanceFields(Self)))) ;
+                                        Send DefineAllInstanceColumns
+        // Register with containing cResourceHandler object
+        Delegate Send SetHandler Self
+        
+        // Is this the first API object to be registered with this handler?
+        String sIntPath
+        Delegate Get psInterfacePath to sIntPath
+        If (sIntPath = "") ;
+            Set psInterfacePath to (psCollName(Self))
+
+        Forward Send End_Construct_Object
+    End_Procedure
+    
+    // Function FieldJsonType
+    // ======================
+    // The function takes a table handle (assumed to be open) and a column integer
+    // and returns the appropriate JSON type from the database data type
+    Function FieldJsonType Handle hTable Integer iFld Returns Integer
+        Integer iType iJType iPrc
+        
+        Get_Attribute DF_FIELD_TYPE of hTable iFld to iType
+        
+        If (iType = DF_BCD) Begin
+            Get_Attribute DF_FIELD_PRECISION of hTable iFld to iPrc
+            
+            If (iPrc = 0) ;
+                Move jsonTypeInteger    to iJType
+            Else          ;
+                Move jsonTypeDouble     to iJType
+        End
+        Else If (iType = DF_OVERLAP) ;
+            Move jsonTypeOverlap        to iJType
+        Else If (iType = DF_BINARY)  ;
+            Move jsonTypeBinary         to iJType
+        Else ;
+            Move jsonTypeString         to iJType
+        
+        Function_Return iJType
+    End_Function
+
+    // Function RESTField
+    // ==================
+    // Takes the table and column integers for a field and returns a struct with
+    // those plus the DataFlex and JSON field types and the field name
+    Function RESTField Handle htTable Integer iCol Returns stRESTField
+        String      sName sTab
+        stRESTField  tField
+        
+        Move htTable                                        to tField.iTable
+        Move iCol                                           to tField.iColumn
+        Get_Attribute DF_FIELD_TYPE of htTable iCol         to tField.iDFType
+        Get_Attribute DF_FIELD_NAME of htTable iCol         to sName
+        
+        If (htTable <> Main_File(phoDD(Self))) Begin
+            Get_Attribute DF_FILE_DISPLAY_NAME of htTable   to sTab
+            Move (sTab + "." + sName)                       to tField.sName
+        End
+        Else ;
+            Move sName                                      to tField.sName
+        
+        Get FieldJsonType             htTable  iCol         to tField.iJType
+        
+        Function_Return tField
+    End_Function
+    
+    // Procedure DefineColumns
+    // =======================
+    // Loads the patFields array property with what we will want to know about 
+    // the table's columns
+    Procedure DefineColumns
+        Integer      i iFields
+        stRESTField[] atFields
+        Handle       htTable
+        
+        Get Main_File of (phoDD(Self)) to htTable
+
+        Get_Attribute DF_FILE_NUMBER_FIELDS of htTable to iFields
+        
+        For i from 0 to iFields
+            Get RESTField htTable i to atFields[i]
+        Loop
+        
+        Set patFields to atFields
+    End_Procedure
+    
+    // Procedure DefineAllInstanceFields
+    // =================================
+    // Adds all the tables fields to the 
+    Procedure DefineAllInstanceColumns
+        Integer[] aiFields
+        Integer   iMax i
+        
+        Get_Attribute DF_FILE_NUMBER_FIELDS of (Main_File(phoDD(Self))) to iMax
+        
+        For i from 1 to iMax
+            Move i to aiFields[i - 1]
+        Loop
+        
+        Set paiDefaultInstanceFields to aiFields
+    End_Procedure
+    
+    // Procedure SetListDefaults
+    // =========================
+    // Sets the default columns to return for each instance in a List operation
+//    Procedure SetListDefaults
+//        Integer[]    aiFields
+//        stRESTField[] atFields
+//        Integer      i iLast iTab iCol j iArg
+//        Handle       htMainTab
+//        
+//        Get Main_File of (phoDD(Self))  to htMainTab
+//        
+//        Move (num_arguments / 2) to iLast
+//        
+//        For i from 1 to iLast
+//            Move (i * 2 - 1) to iArg
+//            Move iArg&       to iTab
+//            Move (i * 2)     to iArg
+//            Move iArg&       to iCol
+//            
+//            If (iTab <> htMainTab) Begin
+//                If not (SizeOfArray(patFields(Self))) ;
+//                                               Send DefineColumns
+//                Get patFields                   to atFields
+//                Move (SizeOfArray(atFields))    to j
+//                Get RESTField iTab iCol         to atFields[j]
+//                Move j                          to aiFields[i - 1]
+//                Set patFields                   to atFields
+//            End
+//            Else ;
+//                Move iCol to aiFields[i - 1]
+//
+//        Loop
+//        
+//        Set paiDefaultListFields to aiFields
+//    End_Procedure
+    
+    // Procedure AddListColumn
+    // =======================
+    // Adds a column to the list operation.
+    // Call with File_Field TableName.ColumnName.
+    Procedure AddListColumn Handle htTable Integer iColumn
+        stRESTField[] atFields
+        Integer[]     aiFields
+        Integer       i j
+        
+        Get paiDefaultListFields        to aiFields
+        Move (SizeOfArray(aiFields))    to i
+        
+        If (htTable <> Main_File(phoDD(Self))) Begin
+            If not (SizeOfArray(patFields(Self))) ;
+                                            Send DefineColumns
+            Get patFields                   to atFields
+            Move (SizeOfArray(atFields))    to j
+            Get RESTField htTable iColumn   to atFields[j]
+            Set patFields                   to atFields
+            Move j                          to aiFields[i]
+        End
+        Else ;
+            Move iColumn                    to aiFields[i]
+        
+        Set paiDefaultListFields            to aiFields
+    End_Procedure
+    
+    // Procedure AddInstanceColumn
+    // ===========================
+    // Adds a column to the instance operation.
+    // Call with File_Field TableName.ColumnName.
+    Procedure AddInstanceColumn Handle htTable Integer iColumn
+        stRESTField[] atFields
+        Integer[]     aiFields
+        Integer       i j
+        
+//        If (pbAllInstanceColumns(Self) and ;
+//            (SizeOfArray(paiDefaultInstanceFields(Self)) = 0)) ;
+//                                    Send DefineAllInstanceColumns
+        Get paiDefaultInstanceFields    to aiFields
+        Move (SizeOfArray(aiFields))    to i
+        
+        If (htTable <> Main_File(phoDD(Self))) Begin
+            If not (SizeOfArray(patFields(Self))) ;
+                                            Send DefineColumns
+            Get patFields                   to atFields
+            Move (SizeOfArray(atFields))    to j
+            Get RESTField htTable iColumn   to atFields[j]
+            Set patFields                   to atFields
+            Move j                          to aiFields[i]
+        End
+        Else ;
+            Move iColumn                    to aiFields[i]
+            
+        Set paiDefaultInstanceFields        to aiFields
+    End_Procedure
+    
+    // Procedure AddReadOnlyColumn
+    // ===========================
+    // Adds a column to be treated as Read-Only.
+    // Call with Field TableName.ColumnName or
+    // (RefTable(TableName.ColumnName)).
+    Procedure AddReadOnlyColumn Integer iColumn
+        Integer[] aiFields
+        
+        Get paiReadOnlyFields           to aiFields
+        Move iColumn                    to aiFields[SizeOfArray(aiFields)]
+        Set paiReadOnlyFields           to aiFields
+    End_Procedure
+    
+    // Procedure AddExcludeColumn
+    // ===========================
+    // Adds a column to be excluded from all operations.
+    // Call with Field TableName.ColumnName or
+    // (RefTable(TableName.ColumnName)).
+    Procedure AddExcludeColumn Integer iColumn
+        Integer[] aiFields
+        
+        Get paiExcludeFields            to aiFields
+        Move iColumn                    to aiFields[SizeOfArray(aiFields)]
+        Set paiExcludeFields            to aiFields
+    End_Procedure
+    
+    // Function AddFunctionColumn
+    // ==========================
+    // SHOULD NOT BE CALLED DIRECTLY!  Just removes duplication from the two
+    // procedures below: AddListFunctionColumn and AddInstanceFunctionColumn
+    // which are the ones you SHOULD call.
+    Function _AddFunctionColumn String sName Handle hoObject ;
+                               Handle hfFunction Integer iJsonType Returns Integer
+        stRESTField[] atFields
+        Integer       i
+        
+        // If patFields is not yet populated, do that now first
+        If not (SizeOfArray(patFields(Self))) ;
+                                       Send DefineColumns
+        
+        Get patFields to atFields
+        Move (SizeOfArray(atFields)) to i
+        
+        Move hoObject   to atFields[i].hoObject
+        Move hfFunction to atFields[i].hfFunction
+        Move sName      to atFields[i].sName
+        Move iJsonType  to atFields[i].iJType
+        Set patFields   to atFields
+        
+        Function_Return i
+    End_Function
+    
+    // Procedure AddListFunctionColumn
+    // ===============================
+    // Allows adding a calculated column to a listing
+    Procedure AddListFunctionColumn String sName Handle hoObject ;
+                                    Handle hfFunction Integer iJsonType
+        Integer[] aiFields
+        Integer   iPos
+        
+        Get _AddFunctionColumn sName hoObject hfFunction iJsonType to iPos
+        
+        Get paiDefaultListFields to aiFields
+        Move iPos to aiFields[SizeOfArray(aiFields)]
+        Set paiDefaultListFields to aiFields
+    End_Procedure
+    
+    // Procedure AddInstanceFunctionColumn
+    // ===================================
+    // Allows adding a calculated column to an instance
+    Procedure AddInstanceFunctionColumn String sName Handle hoObject ;
+                                        Handle hfFunction Integer iJsonType
+        Integer[] aiFields
+        Integer   iPos
+        
+        If (pbAllInstanceColumns(Self) and ;
+           not (SizeOfArray(paiDefaultInstanceFields(Self)))) ;
+                            Send DefineAllInstanceColumns
+        
+        Get _AddFunctionColumn sName hoObject hfFunction iJsonType to iPos
+
+        Get paiDefaultInstanceFields to aiFields
+        Move iPos to aiFields[SizeOfArray(aiFields)]
+        Set paiDefaultInstanceFields to aiFields
+    End_Procedure
+
+    // Function JsonFromDD
+    // ===================
+    // Takes a DD object and returns a JSON object populated with the current
+    // DD values for it.  If aiFields is not empty it is used as a list of the
+    // columns to include, otherwise all will be returned.  Overlaps will be
+    // skipped.  Binary fields will only be returned if the property
+    // pbReturnBinary is set to True (False by default).
+    Function JsonFromDD Handle hoDD Integer[] aiFields Returns Handle
+        Handle    hoJson htTable hoField
+        Integer   i iFields iMax iField iType
+        stRESTField[] atFields
+        stRESTField tField
+        String    sName sValue
+        Integer[] aiExclude
+        UChar[]   ucaVal
+        
+        Get Main_File of hoDD   to htTable
+        Get paiExcludeFields    to aiExclude
+        Get patFields           to atFields
+        Get CreateJsonObject    to hoJson
+        
+        Move (SizeOfArray(aiFields) - 1) to iMax
+
+        For i from 0 to iMax
+            Move aiFields[i] to iField
+            
+            // Do not return RECNUM
+            If (aiFields[i] <= 0) ;
+                Break Begin
+            
+            // Do not return excluded fields
+            If (SearchArray(iField, aiExclude) > -1) ;
+                                                Break Begin
+
+            Move atFields[iField] to tField
+            
+            If (tField.hfFunction) Begin
+                
+                If ((tField.iJType = jsonTypeObject) or ;
+                    (tField.iJType = jsonTypeArray)) Begin
+                    Get tField.hfFunction of tField.hoObject Self to hoField
+                    
+                    If hoField Begin
+                        Send SetMember of hoJson tField.sName hoField
+                        Send Destroy of hoField
+                    End
+                    
+                End
+                Else Begin
+                    Get tField.hfFunction of tField.hoObject Self to sValue
+                    Send SetMemberValue of hoJson tField.sName tField.iJType sValue
+                End
+                
+            End
+            Else Begin
+                
+                If (tField.iDFType <> DF_OVERLAP) Begin  // Ignore overlaps
+                    
+                    If ((tField.iDFType = DF_BINARY) and ;
+                        pbReturnBinary(Self)) Begin
+                            Get File_Field_Current_UCAValue of hoDD ;
+                                tField.iTable tField.iColumn                to ucaVal
+                            Get Base64EncodeUCharArray of oTrans ucaVal     to ucaVal
+                            Send SetMemberValue of hoJson tField.sName jsonTypeString ;
+                                (UCharArrayToString(ucaVal))                        
+                    End
+                    Else Begin
+                        Get File_Field_Current_Value of hoDD tField.iTable tField.iColumn to sValue
+
+                        If (tField.iDFType = DF_DATE) Begin
+                            Move (ConvertToClient(DF_DATE, sValue))        to sValue
+                        End
+                        
+                        If (tField.iDFType = DF_DATETIME) Begin
+                            Move (ConvertToClient(DF_DATETIME, sValue))    to sValue
+                        End
+                        
+                        Send SetMemberValue of hoJson tField.sName tField.iJType (Trim(sValue))
+                    End
+                    
+                End
+            
+            End
+            
+        Loop
+
+        Function_Return hoJson
+    End_Function
+    
+    // Procedure OnUnrecognizedField
+    // =============================
+    // Developer hook for handling updates containing JSON elememts which do
+    // NOT correspond to a field in the table.
+    Procedure OnUnrecognizedField String sMemberName Handle hoMember
+        // This will by default simply trigger the 4100 error so we carefully
+        // ignored below, but can be overridden to do whatever the developer
+        // requires.
+        Error 4100 sMemberName
+        // If you do NOT want to generate this error, override the method
+        // WITHOUT forward sending it.
+    End_Procedure
+    
+    Procedure RegisterUpdateHandler String sName Handle hmProc
+        String[] asNames
+        Handle[] ahmProcs
+        Integer  iIdx
+        
+        Move (Lowercase(sName))             to sName
+        Get pasUpdateProcNames              to asNames
+        Move (SearchArray(sName, asNames))  to iIdx
+        
+        If (iIdx <> -1) ; // already registered
+            Procedure_Return
+        
+        Move (SizeOfArray(asNames))         to iIdx
+        Get pahmUpdateProcedures            to ahmProcs
+        Move sName                          to asNames[iIdx]
+        Move hmProc                         to ahmProcs[iIdx]
+        Set pasUpdateProcNames              to asNames
+        Set pahmUpdateProcedures            to ahmProcs
+    End_Procedure
+    
+    Function UpdateHandlerProc String sProc Returns Handle
+        String[] asNames
+        Handle[] ahmProcs
+        Integer  iIdx
+        
+        Get pasUpdateProcNames to asNames
+        Move (SearchArray(sProc, asNames)) to iIdx
+        If (iIDx = -1) ;  // not found
+            Function_Return 0
+
+        Get pahmUpdateProcedures to ahmProcs
+        Function_Return ahmProcs[iIdx]
+    End_Function
+    
+    // Procedure UpdateDDFromJson
+    // ==========================
+    // The procedure can be used to update a DDO with data from identically
+    // named fields (NOT case-sesitive) in a passed JSON object.  Pass it
+    // the handle of the DD object to be updated and the handle of a JSON
+    // object with the appropriate members.  You can then use the Should_Save
+    // property of the DDO to determine whether a save is required.  It will
+    // ignore JSON NULLs.
+    Procedure UpdateDDFromJson Handle hoDD Handle hoJson
+        Integer   iMembs i iType iField iOpt
+        String    sMemb sJVal sDVal sProc
+        Handle    htTable hoMember hmProc
+        Integer[] aiExclude aiReadOnly
+        UChar[]   ucaVal
+        Boolean   bProcessed
+        
+        If not hoJson ;
+            Procedure_Return
+            
+        If not (JsonType(hoJson) = jsonTypeObject) ;
+            Procedure_Return
+
+        Get paiExcludeFields        to aiExclude
+        Get paiReadOnlyFields       to aiReadOnly
+        Get Main_File of hoDD       to htTable
+        Get MemberCount of hoJson   to iMembs
+        Decrement iMembs
+        
+        For i from 0 to iMembs
+            Move False to bProcessed
+            Get MemberNameByIndex of hoJson i to sMemb
+            If (MemberJsonType(hoJson, sMemb) = jsonTypeNull) ;
+                                                    Break Begin // Skip nulls - no use to us
+            
+            If (Lowercase(Left(sMemb, Length(C_restProcPrefix))) = C_restProcPrefix) Begin
+                Move (Lowercase(Right(sMemb, (Length(sMemb) - Length(C_restProcPrefix))))) to sProc
+                Get UpdateHandlerProc sProc to hmProc
+                
+                If hmProc Begin
+                    Send hmProc (Member(hoJson, sMemb))
+                    Move True to bProcessed
+                End
+                
+            End
+            
+            If bProcessed ;
+                Break Begin
+            
+            // We ignore the error 4100 which will occur will occur if member
+            // is NOT a field in the table when Field_Map tries to evaluate it
+            // because we want to handle that ourselves below using the
+            // OnUnrecognizedField developer hook.
+            Send IgnoreError 4100
+            Field_Map htTable sMemb to iField
+            Send TrapError 4100
+            
+            If (SearchArray(iField, aiExclude) > -1) ;
+                                                    Break Begin
+            If (SearchArray(iField, aiReadOnly) > -1) ;
+                                                    Break Begin
+
+            If (iField <> 0) Begin
+                Get MemberValue of hoJson sMemb                     to sJVal
+                Get Field_Current_Value of hoDD iField              to sDVal
+                Get_Attribute DF_FIELD_TYPE of htTable iField       to iType
+                
+                If (iType = DF_BINARY) Begin
+                    Move (StringToUCharArray(sJVal))                to ucaVal
+                    Get Base64DecodeUCharArray of oTrans ucaVal     to ucaVal
+                    Set Field_Current_UCAValue of hoDD iField       to ucaVal
+                    Set Field_Changed_State    of hoDD iField       to True
+                End
+                Else Begin
+                    
+                    If (iType = DF_DATE) ;
+                        Move (ConvertFromClient(typeDate, sJVal))       to sJVal
+                
+                    If (iType = DF_DATETIME) ;
+                        Move (ConvertFromClient(typeDateTime, sJVal))   to sJVal
+                
+                    Get Field_Option of hoDD iField DD_CAPSLOCK     to iOpt
+                    If (iOpt = 1) ;
+                        Move (Uppercase(sJVal))                     to sJVal
+                        
+                    If (sJVal <> sDVal) Begin
+                        Set Field_Changed_Value of hoDD iField      to sJVal
+                    End
+                
+                End
+                
+            End
+            Else Begin
+                Get Member of hoJson sMemb to hoMember
+                Send OnUnrecognizedField sMemb hoMember Self
+            End
+            
+        Loop
+
+    End_Procedure
+
+    // Function RequiredConditions
+    // ===========================
+    // For override - used to find reqired parent records not in direct line
+    // from JSON in the passed data - will usually only be required by create.
+    // However see FindRequirement, which this can be used in most cases to call
+    // as a one-liner to do what it needs.
+    Function RequiredConditions Handle hoJson Integer iMode Returns Boolean
+        Function_Return True
+    End_Function
+    
+    // Function FindRequirement
+    // ========================
+    // This function is designed to remove the code duplication inherent in all
+    // the RequiredCondition functions in the various instances.  It will
+    // perform what most of them do in one line.  It is designed to be called in
+    // one line from the RequiredCondition function if things are that simple
+    // (which is very often the case).  Six arguments is really too many, but
+    // them's the breaks.
+    Function FindRequirement Handle hoJson Integer iMode String sRequirement ;
+                             Handle hoDD Integer iIdx Integer iField Returns Boolean
+        Boolean bFound
+        String  sID
+        
+        Move False to bFound
+        
+        If (iMode = C_restModeCreate) Begin
+            
+            If (HasMember(hoJson, sRequirement)) Begin
+                Get MemberValue of hoJson sRequirement to sID
+                Get FindRecord hoDD iField iIdx sID to bFound
+            End
+            
+            If not bFound Send RequirementMissing ;
+                ("A valid '" + sRequirement + "' element must be present in the passed JSON")
+        End
+        Else ;
+            Move True to bFound
+        
+        Function_Return bFound
+    End_Function
+    
+    // Function FindMultiSegRequirement
+    // ================================
+    // This function is designed to provide the same mechanism as FindRequirement
+    // above, but to work with multi-segment keys by passing arrays of both
+    // reqirements and fields.  Because of this added complexity it cannot
+    // use the simple FindRecord mechanism as in FindRequirement, but must do all
+    // of the work in-line.
+    Function FindMultiSegRequirement Handle hoJson Integer iMode String[] asReqs ;
+                                     Handle hoDD Integer iIdx Integer[] aiCols ;
+                                     Returns Boolean
+        Boolean  bFound
+        Integer  i iMax
+        Handle   hTab
+        String   sVal sCol sMsg sTab
+        String[] asColVals
+        
+        Move False to bFound
+        
+        If (iMode = C_restModeCreate) Begin
+            Move (SizeOfArray(asReqs) - 1) to iMax
+            
+            Get Main_File of hoDD to hTab
+            Send Clear of hoDD
+            
+            For i from 0 to iMax
+                
+                If (HasMember(hoJson, asReqs[i])) Begin
+                    Get MemberValue of hoJson asReqs[i] to sVal
+                    Set_Field_Value hTab aiCols[i] to sVal
+                    Move sVal to asColVals[i]
+                End
+                Else Begin
+                    Send RequirementMissing ;
+                        ("A valid '" + asReqs[i] * "' element must be present in the passed JSON")
+                    Function_Return False
+                End
+                
+            Loop
+                
+            // The key fields in index iIdx should now be populated
+            Send Find of hoDD GE iIdx
+            Move (Found) to bFound
+            
+            If bFound Begin
+
+                For i from 0 to iMax
+                    Get Field_Current_Value of hoDD aiCols[i] to sVal
+                    Move (sVal = asColVals[i]) to bFound
+                Loop
+                
+                If not bFound ;
+                    Break
+            End
+            
+            If not bFound Begin
+            
+                For i from 0 to iMax
+                    Get_Attribute DF_FIELD_NAME of hTab aiCols[i] to sCol
+                    Move (sMsg + sCol + "=" + asReqs[i]) to sMsg
+                    If (i < iMax) Move (sMsg + ", ") to sMsg
+                Loop
+                
+                Get_Attribute DF_FILE_LOGICAL_NAME of hTab to sTab
+                Send RequirementMissing ;
+                    ("A row with values: " + sMsg * "could not be found in parent table" * sTab)
+                Function_Return False
+            End
+            
+        End
+
+        Function_Return True
+    End_Function
+    
+    // Function CheckRequirement
+    // =========================
+    // Similar to FindRequirement, but rather than checking that a matching
+    // record exists in a table, this simply checks that it has been passed
+    // in the JSON
+    Function CheckRequirement Handle hoJson Integer iMode String sRequirement Returns Boolean
+        Boolean bOK
+        String  sVal
+        
+        Move False to bOK
+        
+        If (iMode = C_restModeCreate) Begin
+            
+            If (HasMember(hoJson, sRequirement)) Begin
+                Get MemberValue of hoJson sRequirement to sVal
+                If (sVal <> "") Move True to bOK
+            End
+            
+            If not bOK Send RequirementMissing ;
+                ("A '" + sRequirement + "' element must be present in the passed JSON")
+        End
+        Else ;
+            Move True to bOK
+        
+        Function_Return bOK
+    End_Function
+    
+    // Procedure SetRequirement
+    // ========================
+    // Like the CheckRequirement above, but if the requirement is missing from
+    // the JSON, it just puts it in there - this should really be in the Creating
+    // method of the DD, but if not we can do it here
+    Procedure SetRequirement Handle hoJson Integer iMode String sRequirement String sValue
+        
+        If (iMode = C_restModeCreate) Begin
+            
+            If not (HasMember(hoJson, sRequirement)) ;
+                Send SetMemberValue of hoJson sRequirement jsonTypeString sValue
+        End
+
+    End_Procedure
+    
+    // Procedure RequirementMissing
+    // ============================
+    // What to send if RequiredConditions fails
+    Procedure RequirementMissing String sErrMsg
+        Send SetStandardResponseStatus 400
+        Send OutputError "Requirement missing" sErrMsg
+    End_Procedure
+    
+    // Function PreProc
+    // ================
+    // Will attempt to find related records for the current table so that 
+    // the constrains defined by the Constrain_File relationships can be
+    // fulfilled.
+    // 
+    // It will use the instance IDs defined in the RequestPath 
+    // (via the PathPart n function) to determine the values to use to find
+    // the parent record(s).
+    //
+    // It will fail (return False) with a runtime error if there are
+    // relationships based on multipe columns involved, which will then require
+    // overriding it to manually find the correct parent record(s) involved.
+    Function PreProc Returns Integer
+        Handle    hoDD htConstr hoParent htMain htParent
+        Handle[]  ahoDDOs
+        Integer[] aiFlds aiIdxs
+        Integer   i iLast iFlds iField iIdx
+        String    sVal
+        Boolean   bFound bRelFound
+        
+        Get phoDD to hoDD
+        If not hoDD ;
+            Function_Return False  // There must be a phoDD defined
+        
+        Send Rebuild_Constraints of hoDD
+            
+        Repeat
+            Get Constrain_File of hoDD to htConstr
+            If not htConstr ;
+                Break              // If there is no Constrain_File, exit the loop
+            Get Main_File of hoDD to htMain
+            Get Which_Data_Set of hoDD htConstr to hoParent
+            Move (InsertInArray(ahoDDOs, 0, hoParent))   to ahoDDOs // Push it on top
+            
+            Get_Attribute DF_FILE_NUMBER_FIELDS          of htMain          to iFlds
+            Move False to bRelFound
+            
+            For i from 1 to iFlds
+                
+                If (pbUseDDRelates(hoDD)) ;
+                    Get Field_Related_File of hoDD i                 to htParent
+                Else ;
+                    Get_Attribute DF_FIELD_RELATED_FILE  of htMain i to htParent
+                
+                If (htParent = htConstr) Begin
+                    
+                    If bRelFound Begin  // Multi-column relationship!
+                        Error 683 "Multi-Column relationship detected - override Function PreProc to manually find constraining records"
+                        Function_Return False
+                    End
+                    
+                    If (pbUseDDRelates(hoDD)) ;
+                        Get Field_Related_Field of hoDD i                       to iField
+                    Else ;
+                        Get_Attribute DF_FIELD_RELATED_FIELD of htMain i        to iField
+                    
+                    Get_Attribute DF_FIELD_INDEX of htParent iField             to iIdx
+                    Move True to bRelFound
+                End
+                
+            Loop
+            
+            Move (InsertInArray(aiFlds, 0, iField)) to aiFlds       // Push it on top
+            Move (InsertInArray(aiIdxs, 0, iIdx))   to aiIdxs       // Push it on top
+            Move hoParent to hoDD  // Move UP the relationship line
+        Loop
+        
+        Move True to bFound
+        Move (SizeOfArray(ahoDDOs) - 1) to iLast
+        
+        // Run through the relationships from the top
+        For i from 0 to iLast
+            Get PathPart ((i * 2) + 1)  to sVal
+            Get FindRecord ahoDDOs[i] aiFlds[i] aiIdxs[i] sVal to bFound
+        Until not bFound
+        
+        Function_Return bFound
+    End_Function
+    
+    // Procedure PostProc
+    // ==================
+    // For augmentation - used to add decoration to the response data, such as
+    // links and child collections.  The default will add the owning collection
+    // so you should Forward Send in instances.
+    Procedure PostProc Handle hoResp Integer iMode
+    End_Procedure
+    
+    // Function IndexFromOrder
+    // =======================
+    // For override - returns the index for a specified textual ordering
+    Function IndexFromOrder String sOrder Returns Integer
+        Function_Return (piIndex(Self))
+    End_Function
+    
+    // Function SeedFieldFromOrder
+    // ===========================
+    // For override - returns the field to seed with the "start" query value
+    // based on the textual ordering
+    Function SeedFieldFromOrder String sOrder Returns Integer
+        Function_Return (piKeyColumn(Self))
+    End_Function
+    
+    // Function InstID
+    // ===============
+    // Can be overridden - returns the ID value for the current instance
+    // within a collection.  The reason you might want to override it is if
+    // you have a compound (multi-column) key you need to put into a URL, so
+    // just the single piKeyColumn is insufficient to identify the resource.
+    Function InstID Returns String
+        String  sVal
+        Integer iType iCol
+        Handle  hTable hoDD
+        
+        Get piKeyColumn                                 to iCol
+        Get phoDD                                       to hoDD        
+        Get Field_Current_Value of hoDD iCol            to sVal
+        Get Main_file of hoDD                           to hTable
+        Get_Attribute DF_FIELD_TYPE of hTable iCol      to iType
+        
+        If (iType = DF_DATE) ;
+            Move (ConvertToClient(typeDate, sVal))      to sVal
+        If (iType = DF_DATETIME) ;
+            Move (ConvertToClient(typeDateTime, sVal))  to sVal
+        
+        Function_Return (UrlEncode(Self, sVal))
+    End_Function
+        
+    // Function InstURL
+    // ================
+    // Returns the URL of the instance
+    Function InstURL Integer iMode Returns String
+        String sURL
+        
+        If (iMode = C_restModeCreate) ;
+            Move (BaseURL(Self) + "/" + EncodedPath(Self) + "/" + InstID(Self)) to sURL
+        Else ;
+            Move (BaseURL(Self) + "/" + EncodedPath(Self)) to sURL
+            
+        Function_Return sURL
+    End_Function
+    
+    // Procedure Metadata
+    // ==================
+    // Returns a collection's metadata (just the field definitions)
+    Procedure Metadata
+        Integer[]  aiExclude aiReadOnly
+        Handle     hTab hoDD hoResp hoMeta hoValObj hoVTObj
+        Integer    i j k iFlds iType iLen iPre iFVType iMax
+        String     sName sType sVal sDesc
+        
+        Get phoDD             to hoDD
+        Get Main_File of hoDD to hTab
+
+        Get paiExcludeFields  to aiExclude
+        Get paiReadOnlyFields to aiReadOnly
+        
+        Get CreateJsonArray to hoMeta
+        
+        Get_Attribute DF_FILE_NUMBER_FIELDS of hTab to iFlds
+        
+        For i from 1 to iFlds
+            Get_Attribute DF_FIELD_NAME         of hTab i to sName
+            Get_Attribute DF_FIELD_TYPE         of hTab i to iType
+            
+            If (SearchArray(i, aiExclude) > -1) ;
+                Break Begin
+            
+            If (iType <> DF_OVERLAP) Begin
+                Get_Attribute DF_FIELD_LENGTH       of hTab i to iLen
+                Get_Attribute DF_FIELD_PRECISION    of hTab i to iPre
+                Move "" to sType
+                
+                If (iType = DF_ASCII)       
+                    Move ("String (" + String(iLen) + ")")          to sType
+                If (iType = DF_TEXT)        ;
+                    Move ("Text as String (" + String(iLen) + ")")  to sType
+                If (iType = DF_BCD)         ;
+                    Move ("Number (" + String(iLen - iPre) + "." + String(iPre) + ")") ;
+                                                                    to sType
+                If (iType = DF_DATE)        ;
+                    Move "Date as String (YYYY-MM-DD)"              to sType
+                If (iType = DF_DATETIME)    ;
+                    Move "DateTime as ISO 8601 String"              to sType
+                If (iType = DF_BINARY)      ;
+                    Move ("Binary (" + ;
+                               String(iLen) + ") as base64 String") to sType
+                
+                If (SearchArray(i, aiReadOnly) <> -1) ;
+                    Move (sType * "(Read-Only)")                    to sType
+                    
+                Move 0 to hoVTObj
+                Get Field_Attributes of hoDD to hoValObj
+                
+                Get Field_Validation_Type of hoValObj i to iFVType
+                
+                If (iFVType = FA_VALIDATION_TYPE_TABLE) Begin
+                    Get Value of hoValObj ((i * FA_COUNT) + FA_TABLE_OBJECT) to hoVTObj
+                    
+                    If hoVTObj Begin
+                        Send Request_Fill_From_List of hoVTObj Self msg_None
+                        Move (sType * "- Values") to sType
+                        If (Allow_Blank_State(hoVTObj)) ;
+                            Move (sType * "(not required):")    to sType
+                        Else ;
+                            Move (sType * "(required):")        to sType
+
+                    End
+                    
+                End
+                
+                Send AddMemberValue of hoMeta jsonTypeString ;
+                                                    (Pad(sName, 33) + sType)
+
+                If hoVTObj Begin
+                    Get Data_Item_Count of hoVTObj to iMax
+                    Decrement iMax
+
+                    For k from 0 to iMax
+                        Get Data_Value of hoVTObj k to sVal
+                        Get Data_Description of hoVTObj k to sDesc
+                        Send AddMemberValue of hoMeta jsonTypeString ;
+                                            (Repeat(" ", 36) + sVal + ":" * sDesc)
+                    Loop
+                    
+                End                
+                
+                Increment j
+            End
+            
+        Loop
+        
+        Get CreateJsonObject to hoResp
+        Send SetMember of hoResp (psCollName(Self) * "metadata") hoMeta
+        Send Destroy of hoMeta
+        Send OutputJson hoResp
+    End_Procedure
+    
+    // Function FindInstance
+    // =====================
+    // Finds an instance - may need to be overridden in the even that you are
+    // using some kind of compound keys where piKeyColumn (generally passed in
+    // iCol) will be insufficient to identify the resource.
+    Function FindInstance Handle hoDD Integer iCol Integer iIdx String sID Returns Boolean
+        Boolean bFound
+        Handle  hTable
+        Integer iType
+        
+        Get Main_file of hoDD                           to hTable
+        Get_Attribute DF_FIELD_TYPE of hTable iCol      to iType
+        
+        If (iType = DF_DATE) ;
+            Move (ConvertFromClient(typeDate, sID))     to sID
+        If (iType = DF_DATETIME) ;
+            Move (ConvertFromClient(typeDateTime, sID)) to sID
+        
+        Get FindRecord hoDD iCol iIdx sID               to bFound
+        
+        Function_Return bFound
+    End_Function
+    
+    // Procedure Documentation
+    // =======================
+    // Hook for adding documentation to a list - for override
+    // Simply add an JSON array of strings to hoResp to provide the
+    // documentation you require - example:
+    //
+    //    Procedure Documentation Handle hoResp
+    //        Handle hoDoc
+    //        
+    //        Get CreateJsonArray to hoDoc
+    //        
+    //        Send AddMemberValue of hoDoc jsonTypeString ;
+    //            "This is some documentation of this part of the API"
+    //        Send AddMemberValue of hoDoc jsonTypeString ;
+    //            "It tells the (development) user what sort of things to do"
+    //        Send SetMember of hoResp "documentation" hoDoc
+    //    End_Procedure
+    //
+    // If you want to have the same documentation in different places, you can
+    // call a common procedure from here.
+    Procedure Documentation Handle hoResp
+    End_Procedure
+    
+    // Function RequestFieldsList
+    // ==========================
+    // Returns the contents of the "fields" query string parameter (if any) of
+    // the request as an array of integers using "|" as a delimiter.
+    Function RequestFieldsList Returns Integer[]
+        String    sFields
+        String[]  asFields
+        Integer[] aiFields
+        Integer   i iMax
+        Handle    htTable
+        
+        Get UrlParameter "fields" to sFields
+        
+        If (sFields <> "") Begin
+            Move (StrSplitToArray(sFields, "|"))    to asFields
+            Move (Main_File(phoDD(Self)))           to htTable
+            Move (SizeOfArray(asFields) - 1)        to iMax
+            
+            For i from 0 to iMax
+                Field_Map htTable asFields[i]       to aiFields[i]
+            Loop
+        
+        End
+        
+        Function_Return aiFields
+    End_Function    
+    
+    // Procedure List
+    // ==============
+    // Lists a collection of instances
+    Procedure List
+        Boolean   bFound bSelfLink bCount bOwner bDoc bListLinks
+        Handle    hoInst hoInsts hoResp hoDD htTable
+        String[]  asFields asPath
+        Integer[] aiFields
+        Integer   iCount iLimit iIdx iMode iField iFldTyp i iMax
+        String    sOrd sDirn sStart sParam
+        
+        Get PreProc                     to bFound
+        
+        If not bFound Begin
+            Send NotFound
+            Procedure_Return
+        End
+        
+        Get phoDD                       to hoDD
+        Get Main_File of hoDD           to htTable
+        Send Clear of hoDD
+        
+        Get UrlParameter "listLinks"    to sParam
+        Move (not(Lowercase(sParam) = "off")) ;
+                                        to bListLinks
+
+        Get UrlParameter "limit"        to iLimit
+        If (iLimit = 0) ;
+            Move (piDefaultLimit(Self)) to iLimit
+        Get UrlParameter "order"        to sOrd
+        Move (Lowercase(sOrd))          to sOrd
+        Get UrlParameter "start"        to sStart
+        Get UrlParameter "direction"    to sDirn
+
+        If (Uppercase(sDirn) = "DESC") ;
+            Move (LT)                   to iMode
+        Else ;
+            Move (GT)                   to iMode
+            
+        Get IndexFromOrder sOrd         to iIdx
+        Get SeedFieldFromOrder sOrd     to iField
+        
+        If (sStart <> "") Begin
+            Get_Attribute DF_FIELD_TYPE of htTable iField to iFldTyp
+            
+            If (iFldTyp = DF_DATE) ;
+                Set_Field_Value htTable iField to ;
+                                    (ConvertFromClient(typeDate, sStart))
+            Else If (iFldTyp = DF_DATETIME) ;
+                Set_Field_Value htTable iField to ;
+                                    (ConvertFromClient(typeDateTime, sStart))
+            Else ;
+                Set_Field_Value htTable iField to sStart
+        End
+        
+        If (pbAllowFieldSelection(Self)) ;
+            Move (RequestFieldsList(Self))  to aiFields
+
+        If not (SizeOfArray(aiFields)) ;
+            Get paiDefaultListFields        to aiFields
+        
+        Get CreateJsonArray to hoInsts
+        
+        Repeat
+            Send Find of hoDD iMode iIdx
+            If not (Found) Break
+            Get JsonFromDD hoDD aiFields to hoInst
+            
+            If ((not(pbDisableInstance(Self))) and ;
+                    pbUseListLinks(Self) ;
+                    and bListLinks) ;
+                Send SetMemberValue of hoInst (psHRefName(Self)) jsonTypeString ;
+                                (OriginalURL(Self) + "/" + InstID(Self))
+            Send AddMember of hoInsts hoInst
+            Send Destroy of hoInst
+            Increment iCount
+        Until (iLimit and (iCount >= iLimit))
+        
+        Get CreateJsonObject to hoResp
+        
+        Get UrlParameter "doc" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bDoc
+        If bDoc ;
+            Send Documentation hoResp
+        
+        Get UrlParameter "owner" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bOwner
+        If bOwner ;
+            Get pbUseOwner to bOwner
+        
+        If bOwner Begin
+            
+            If (PathPart(Self, 1) = "") ;  // Top level collection
+                Send SetMemberValue of hoResp (psOwnerName(Self)) jsonTypeString ;
+                                                                 (BaseURL(Self))
+            Else Begin
+                Get pasPathParts to asPath
+                Move (ResizeArray(asPath, SizeOfArray(asPath) - 1)) to asPath
+                Move (SizeOfArray(asPath) - 1) to iMax
+                
+                For i from 0 to iMax
+                    Move (UrlEncode(Self, asPath[i])) to asPath[i]
+                Loop
+                
+                Send SetMemberValue of hoResp (psOwnerName(Self)) jsonTypeString ;
+                    (BaseURL(Self) + "/" + StrJoinFromArray(asPath, "/"))
+            End
+
+        End
+
+        Get UrlParameter "selfLink" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bSelfLink
+        If bSelfLink ;
+            Get pbUseSelfLinks to bSelfLink
+        
+        If bSelfLink ;
+            Send SetMemberValue of hoResp (psHRefName(Self)) jsonTypeString (OriginalURL(Self))
+        
+        Get UrlParameter "count" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bCount
+        If bCount ;
+            Get pbUseCounts to bCount
+            
+        If bCount ;
+            Send SetMemberValue of hoResp (psCountName(Self)) jsonTypeInteger iCount
+        
+        Send SetMember of hoResp (psCollName(Self)) hoInsts
+        Send Destroy of hoInsts
+        Send OutputJson hoResp
+    End_Procedure
+    
+    // Procedure ReturnInstance
+    // ========================
+    // Centralise the return of the instance details to reduce duplicate code
+    Procedure ReturnInstance Handle hoInst Integer iMode String sInstID
+        Handle  hoResp
+        Boolean bSelfLink bDoc bCollection bInstance
+        String  sParam sURL
+        
+        If (iMode = C_restModeCreate) ;
+            Send SetStandardResponseStatus 201  // 201 - Created
+
+        // Create the response object
+        Get CreateJsonObject to hoResp
+        
+        // Attach things that come before the instance:
+        
+        // Doc - does nothing by default, but if overridden thay can turn off
+        Get UrlParameter "doc" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bDoc
+        If bDoc ;
+            Send Documentation hoResp
+            
+        // SelfLink - by default if on, they can choose to turn off
+        Get UrlParameter "selfLink" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bSelfLink
+        If bSelfLink ;
+            Move (pbUseSelfLinks(Self)) to bSelfLink
+        
+        If bSelfLink Begin
+            If (iMode = C_restModeDelete) ;
+               Send SetHRef hoResp ""
+            Else ;
+                Send SetHRef hoResp (InstURL(Self, iMode)) 
+        End
+        
+        Get UrlParameter "returnInstance" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bInstance
+        
+        If (bInstance or (iMode = C_restModeInstance)) ;
+            Send SetMember of hoResp (psInstName(Self)) hoInst        
+
+        Send Destroy of hoInst 
+        
+        // Attach things that come after the instance:
+        
+        // Collection - they can turn this off if set
+        Get UrlParameter "collection" to sParam
+        Move (not(Lowercase(sParam) = "off")) to bCollection
+        If bCollection ;
+            Move (pbUseCollection(Self)) to bCollection
+            
+        If bCollection Begin
+            If (iMode = C_restModeCreate) ;
+                Send SetCollection hoResp (psCollName(Self)) (OriginalURL(Self))
+            Else ;
+                Send SetCollection hoResp (psCollName(Self)) (CollectionURL(Self))
+        End
+
+        Get UrlParameter "dependents" to sParam
+        If (not(Lowercase(sParam) = "off")) ;
+            Send PostProc hoResp iMode  // Allow them to add their own stuff
+        
+        Send OutputJson hoResp
+    End_Procedure
+    
+    // Procedure Instance
+    // ==================
+    // Returns details of an instance
+    Procedure Instance String sID
+        Boolean   bFound
+        String[]  asFields
+        Integer[] aiFields
+        Handle    hoInst hoResp
+        String    sDoc
+        
+        If (pbDisableInstance(Self)) Begin
+            Send SetStandardResponseStatus 405
+            Send OutputError "Not Allowed" "Operation not allowed on this resource"
+            Procedure_Return
+        End
+        
+        Get PreProc to bFound
+        
+        If bFound ;
+            Get FindInstance (phoDD(Self)) (piKeyColumn(Self)) (piIndex(Self)) sID to bFound
+        
+        If not bFound Begin
+            Send NotFound
+            Procedure_Return
+        End
+
+        If (pbAllowFieldSelection(Self)) ;
+            Get RequestFieldsList to aiFields
+        
+        If not (SizeOfArray(aiFields)) ;
+            Get paiDefaultInstanceFields  to aiFields
+        
+        Get JsonFromDD (phoDD(Self)) aiFields to hoInst
+        
+        Send ReturnInstance hoInst C_restModeInstance
+    End_Procedure
+    
+    // Procedure Create
+    // ================
+    // Creates an instance
+    Procedure Create
+        Boolean   bFound bOK
+        Handle    hoJson hoResp hoDD hoInst
+        Integer   iErr
+        Integer[] aiFields
+        String    sErrMsg
+        
+        // Should never get here if this is the case
+        If (pbReadOnly(Self)) Begin
+            Send NotAllowed
+            Procedure_Return
+        End
+        
+        Get phoDD to hoDD
+        Send Clear of hoDD
+        
+        Get PreProc to bFound
+        
+        If not bFound Begin
+            Send NotFound
+            Procedure_Return
+        End
+        
+        Get phoRequestJson to hoJson
+        
+        If (hoJson = -1) ;
+            Procedure_Return
+        
+        If not hoJson Begin
+            Send NoJson
+            Procedure_Return
+        End
+        
+        Get RequiredConditions hoJson C_restModeCreate to bOK
+        
+        If not bOK ;
+            Procedure_Return
+        
+        Get phoDD to hoDD
+        
+        Send UpdateDDFromJson hoDD hoJson
+        
+        If (Should_Save(hoDD)) Begin
+            Get Request_Validate of hoDD to iErr
+            
+            If iErr Begin
+                Send UpdateError C_restModeCreate
+                Procedure_Return
+            End
+            
+            Move (False) to Err
+            
+            Send Request_Save of hoDD
+            
+            If (Err) Begin
+                Send UpdateError C_restModeCreate
+                Procedure_Return
+            End
+
+            If (pbAllowFieldSelection(Self)) ;
+                Get RequestFieldsList to aiFields
+            
+            If not (SizeOfArray(aiFields)) ;
+                Get paiDefaultInstanceFields to aiFields
+
+            Get JsonFromDD hoDD aiFields to hoInst
+            
+            Send ReturnInstance hoInst C_restModeCreate
+        End
+        Else ;
+            Send NothingToUpdate
+        
+    End_Procedure
+    
+    // Procedure Update
+    // ================
+    // Updates an instance
+    Procedure Update String sID
+        Boolean   bFound bOK
+        Handle    hoJson hoResp hoInst hoDD
+        Integer[] aiFields
+        Integer   iErr
+        String    sErrMsg
+        
+        // Should never get here if this is the case
+        If (pbReadOnly(Self)) Begin
+            Send NotAllowed
+            Procedure_Return
+        End
+        
+        If (pbNoUpdate(Self)) Begin
+            Send NotAllowed
+            Procedure_Return
+        End
+        
+        Get phoDD to hoDD
+        
+        Get PreProc to bFound
+
+        If bFound ;
+            Get FindInstance (phoDD(Self)) (piKeyColumn(Self)) (piIndex(Self)) sID to bFound
+        
+        If not bFound Begin
+            Send NotFound
+            Procedure_Return
+        End
+        
+        Get phoRequestJson to hoJson
+        
+        If (hoJson = -1) ;
+            Procedure_Return
+        
+        If not hoJson Begin
+            Send NoJson
+            Procedure_Return
+        End
+        
+        Get RequiredConditions hoJson C_restModeUpdate to bOK
+        
+        If not bOK ;
+            Procedure_Return
+        
+        Send UpdateDDFromJson hoDD hoJson
+        
+        If (Should_Save(hoDD)) Begin
+            Get Request_Validate of hoDD to iErr
+            
+            If iErr Begin
+                Send UpdateError C_restModeUpdate
+                Procedure_Return
+            End
+            
+            Move (False) to Err
+            Send Request_Save of hoDD
+            
+            If (Err) Begin
+                Send UpdateError C_restModeUpdate
+                Procedure_Return
+            End
+
+            If (pbAllowFieldSelection(Self)) ;
+                Get RequestFieldsList to aiFields
+            
+            If not (SizeOfArray(aiFields)) ;
+                Get paiDefaultInstanceFields to aiFields
+
+            Get JsonFromDD hoDD aiFields to hoInst
+            
+            Send ReturnInstance hoInst C_restModeUpdate
+        End
+        Else Begin
+            Send NothingToUpdate
+        End
+        
+    End_Procedure
+    
+    // Procedure Delete
+    // ================
+    // Deletes an instance
+    Procedure Delete String sID
+        Boolean   bFound
+        Handle    hoJson hoResp hoInst hoDD
+        Integer[] aiFields
+        Integer   iErr
+        
+        // Should never get here if this is the case
+        If (pbReadOnly(Self)) Begin
+            Send NotAllowed
+            Procedure_Return
+        End
+        
+        If (pbNoDelete(Self)) Begin
+            Send NotAllowed
+            Procedure_Return
+        End
+        
+        Get phoDD to hoDD
+        
+        Get PreProc to bFound
+        If bFound ;
+            Get FindInstance (phoDD(Self)) (piKeyColumn(Self)) (piIndex(Self)) sID to bFound
+        
+        If not bFound Begin
+            Send NotFound
+            Procedure_Return
+        End
+        
+        Get Validate_Delete of hoDD to iErr
+        
+        If iErr Begin
+            Send UpdateError C_restModeDelete
+            Procedure_Return
+        End
+
+        If (pbAllowFieldSelection(Self)) ;
+            Get RequestFieldsList to aiFields
+            
+        If not (SizeOfArray(aiFields)) ;
+            Get paiDefaultInstanceFields to aiFields
+
+        Get JsonFromDD hoDD aiFields to hoInst
+        
+        Move (False) to Err
+        Send Request_Delete of hoDD
+        
+        If (Err) Begin
+            Send Destroy of hoInst
+            Send UpdateError C_restModeDelete
+            Procedure_Return
+        End
+        
+        Send ReturnInstance hoInst C_restModeDelete
+    End_Procedure
+
+End_Class

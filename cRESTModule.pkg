@@ -1,0 +1,118 @@
+Use UI
+
+Class cRESTModule is a cObject
+    
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        
+        Property String   psInterfacePath
+        Property String   psInterfaceDesc
+        Property Boolean  pbAutoRegister        True
+        Property Boolean  pbIncludeInApiRoot    True
+        Property String[] pasInterfacePaths
+        Property Handle[] pahoInterfaces
+        Property Integer  piNestingDepth        (piNestingDepth(Parent(Self)) + 1)
+    End_Procedure
+    
+    Procedure End_Construct_Object
+        If (pbAutoRegister(Self)) ;
+            Delegate Send RegisterInterface Self
+
+        Forward Send End_Construct_Object
+    End_Procedure
+
+    Procedure RegisterInterface Handle hoObj
+        Handle[] ahoInterfaces
+        Integer  iIdx
+        String   sPath
+        String[] asPaths
+        
+        Get pahoInterfaces to ahoInterfaces
+        Move (SearchArray(hoObj, ahoInterfaces)) to iIdx
+        
+        If (iIdx <> -1) ;
+            Procedure_Return  // Already registered
+        
+        Move (SizeOfArray(ahoInterfaces))   to iIdx
+        Get psInterfacePath of hoObj        to sPath
+        
+        If (sPath = "") Begin
+            Error 999 ("Interface path (psInterfacePath) not set for ResourceHandlerObject" * ;
+                       Name(hoObj))
+            Procedure_Return
+        End
+        
+        Move (Lowercase(sPath))             to sPath
+        Get pasInterfacePaths               to asPaths
+        Move hoObj                          to ahoInterfaces[iIdx]
+        Move sPath                          to asPaths[iIdx]
+        Set pahoInterfaces                  to ahoInterfaces
+        Set pasInterfacePaths               to asPaths
+    End_Procedure
+    
+    Procedure AddRegisteredCollections Handle hoResp
+        Handle[] ahoInterfaces
+        Integer  iLast i
+        String   sPath sDesc
+        Boolean  bInc
+        Handle   hoObj
+        
+        Get pahoInterfaces to ahoInterfaces
+        Move (SizeOfArray(ahoInterfaces) - 1) to iLast
+        
+        For i From 0 to iLast
+            Move ahoInterfaces[i] to hoObj
+            Get pbIncludeInAPIRoot of hoObj to bInc
+            
+            If bInc Begin
+                Get psInterfacePath of hoObj to sPath
+                Get psInterfaceDesc of hoObj to sDesc
+                If (sDesc = "") ;
+                    Move sPath to sDesc                
+                Send AddCollection hoResp sDesc ;
+                    (BaseURL(Self) + "/" + psInterfacePath(Self) + "/" + sPath)
+            End
+            
+        Loop
+        
+    End_Procedure
+    
+    Procedure ModuleRoot
+        Handle hoResp
+        
+        Get CreateJsonObject to hoResp
+        Send SetMemberValue of hoResp "Module Name" jsonTypeString (psInterfaceDesc(Self))
+        
+        Send AddRegisteredCollections hoResp        
+        
+        Send OutputJson hoResp
+    End_Procedure
+    
+    Procedure ProcessRequest
+        String   sPart1
+        String[] asPaths
+        Integer  iIdx
+        Handle[] ahoHandlers
+        
+        Get PathPart (piNestingDepth(Self)) to sPart1
+        
+        If (sPart1 = "") ;        
+            Send ModuleRoot
+        Else Begin
+            Move (Lowercase(sPart1)) to sPart1
+            Get pasInterfacePaths    to asPaths
+        
+            Move (SearchArray(sPart1, asPaths)) to iIdx
+
+            If (iIdx = -1) Begin  // Not registered
+                Send UnrecognisedOperation
+                Procedure_Return
+            End
+        
+            Get pahoInterfaces to ahoHandlers
+            Send ProcessRequest of ahoHandlers[iIdx]
+        End
+        
+    End_Procedure
+
+End_Class

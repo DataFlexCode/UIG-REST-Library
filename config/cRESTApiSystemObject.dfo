@@ -1,0 +1,4 @@
+Object oRESTApiSystemObject is a cApiSystemObject
+    Set phoDD       to 0
+    Set psCollName  to ""
+End_Object

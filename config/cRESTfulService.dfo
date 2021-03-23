@@ -1,0 +1,40 @@
+Object oRESTfulService is a cRESTfulService
+    Set psPath to "api"
+    Set pbVerboseErrors to False
+    
+    // Add "Use" statements for your cResourceHandler objects here:
+
+    Procedure APIRoot
+        Handle hoResp
+        
+        Get CreateJsonObject to hoResp
+        Send AddRegisteredCollections hoResp        
+        
+        Send OutputJson hoResp
+    End_Procedure
+    
+    Procedure ProcessHttpRequest String sVerb
+        String sPart0
+        
+        Get PathPart 0 to sPart0
+        Move (Lowercase(sPart0)) to sPart0
+        
+        Case Begin
+        
+            Case ((sVerb = C_httpGet) and (sPart0 = ""))
+                Send APIRoot
+                Case Break
+            
+            Case (IsRegisteredPath(Self, sPart0))
+                Send AutoProcess sPart0
+                Case Break
+        
+            Case Else
+                Send UnrecognisedOperation
+                Case Break
+        
+        Case End
+        
+    End_Procedure
+
+End_Object

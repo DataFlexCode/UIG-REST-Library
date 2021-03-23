@@ -1,0 +1,8 @@
+Object oRESTResourceHandler is a cResourceHandler
+    Set psInterfacePath to ""
+
+// Add your data-dictionary objects here
+
+// Add your cRESTApiObjects here (below the Set Main_DD line)
+
+End_Object

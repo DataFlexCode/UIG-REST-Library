@@ -1,0 +1,242 @@
+//==============================================================================
+// cRESTResourceHandler.pkg
+// ------------------------
+// Simply a layer from which the individual API resource handlers will inherit.
+// Used for common code required by them.  Turns out to have been a pretty good
+// idea!  :-)
+//
+//------------------------------------------------------------------------------
+// Date         Author  Comments
+// ----------   ------  --------------------------------------------------------
+// 03/04/2019   MJP     Implemented registration with service to allow automatic
+//                      handling of Send Process and AddCollection (to API root)
+// 14/12/2018   MJP     Changed class name to RESTResourceHandler as per Sture's
+//                      suggestions
+// 15/08/2018   MJP     Refactored to massively reduce code and be able to
+//                      handle any depth of API call
+// 24/08/2018   MJP     Adding common handler functionality to handle
+//                      ProcessRequest and determine the correct handler
+//                      object.
+// 07/08/2018   MJP     Original
+//==============================================================================
+
+Use cRESTApiObject.pkg
+Use cRESTApiSystemObject.pkg
+Use RESTConstants.pkg
+
+Register_Function  UserAccess Handle hTable Returns Boolean
+Register_Function  HasApiAccess String sAPI Returns Boolean
+Register_Procedure RegisterWithService Handle hoObj
+
+{ DDOHost=True }
+Class cRESTResourceHandler is a cObject
+    
+    Procedure Construct_object
+        Forward Send Construct_Object
+        
+        { DesignTime=False }
+        Property Handle   Main_DD  0  // Allows it to contain DDOs
+        Property String[] pasHandlerNames
+        Property Handle[] pahoHandlerObjects
+        Property Handle   phoAccessControl
+        Property Handle   phmAccessControl
+        Property Boolean  pbReadOnly
+        Property String   psInterfacePath
+        Property String   psInterfaceDesc
+        Property Boolean  pbIncludeInAPIRoot    True
+        Property Boolean  pbAutoRegister        True
+
+        Set peNeighborhood to nhPublic
+    End_Procedure
+    
+    Procedure End_Construct_Object
+        
+        If (pbAutoRegister(Self)) ;
+            Send RegisterInterface Self
+        Forward Send End_Construct_Object
+    End_Procedure
+    
+    // Function FindRecord
+    // ===================
+    // Simply allows finding equal to an ID by an index in one line returning
+    // whether the record was found.  Since often this will be how instance
+    // resources are found it makes (some) sense to turn it into a one-liner.
+    //
+    // Usage:
+    //  Get FindRecord oOrderHea_DD (RefTable(OrderHea.Order_Number)) 1 sOrd to bFound
+    // vs:
+    //   Send Clear of oOrderHea_DD
+    //   Move sOrd to OrderHea.Order_Number 
+    //   Send Find of oOrderHea_DD EQ 1
+    //
+    // Slightly less typing, but only one line rather than three, keeping
+    // business functions shorter.
+    Function FindRecord Handle hoDD Integer iKeyFld Integer iIdx String sID Returns Boolean
+        String  sFoundID
+        Handle  hTab
+        
+        Get Main_File of hoDD to hTab
+        Send Clear of hoDD
+        Set_Field_Value hTab iKeyFld to sID
+        Send Find of hoDD GE iIdx
+        
+        If (Found) Begin
+            Get Field_Current_Value of hoDD iKeyFld to sFoundID
+            Move (sFoundID = sID) to Found
+        End
+
+        Function_Return (Found)
+    End_Function
+
+    // Procedure SetHandler
+    // ====================
+    // The hook used by objects of the cRESTApiObject class (or the 
+    // cRESTApiSystemObject sublass) to register themselves with the 
+    // containing object of this class
+    Procedure SetHandler Handle hoObj
+        String[] asNames
+        Handle[] ahoHandlers
+        Integer  iPos
+        String   sName
+        
+        Get psCollName of hoObj to sName
+        Get pasHandlerNames     to asNames
+        Get pahoHandlerObjects  to ahoHandlers
+        
+        Move (SearchArray(Lowercase(sName), asNames)) to iPos
+        
+        If (iPos = -1) ;
+            Move (SizeOfArray(asNames)) to iPos
+        
+        Move (Lowercase(sName)) to asNames[iPos]
+        Move hoObj              to ahoHandlers[iPos]
+        
+        Set pasHandlerNames     to asNames
+        Set pahoHandlerObjects  to ahoHandlers
+    End_Procedure
+    
+    // Function HandlerObject
+    // ======================
+    // Returns the object of the cRESTApiObject class which handles the passed 
+    // resource
+    Function HandlerObject String sName Returns Handle
+        String[] asNames
+        Handle[] ahoHandlers
+        Integer  iPos
+        
+        Get pasHandlerNames     to asNames
+        Get pahoHandlerObjects  to ahoHandlers
+        
+        Move (SearchArray(Lowercase(sName), asNames)) to iPos
+        
+        If (iPos >= 0) ;
+            Function_Return ahoHandlers[iPos]
+    End_Function
+
+    // Procedure ProcessRequest
+    // ========================
+    // Works out the correct hander (of class cRESTApiObject) for a request and
+    // calls the appropriate method in it - the main entry point for processing
+    // requests
+    Procedure ProcessRequest
+        String   sVerb sInstID sMeta
+        String[] asParts
+        Integer  iLast iDepth i
+        Handle   hoHandler hoAccess hmAccess
+        Boolean  bAllowAccess bReadOnly bSystem
+        
+        Get phoAccessControl to hoAccess
+        Get phmAccessControl to hmAccess
+        Get pasPathParts     to asParts
+        Get piNestingDepth   to iDepth
+        
+        If (hoAccess and hmAccess) ;
+            Get hmAccess of hoAccess asParts[iDepth] to bAllowAccess
+        Else ;
+            Move True to bAllowAccess
+            
+        If not bAllowAccess Begin
+            Send Unauthorized "You do not have rights to access this interface"
+            Procedure_Return
+        End
+                
+        Send Clear_All of (Main_DD(Self))
+        
+        Get pbReadOnly                  to bReadOnly
+        Get psRequestVerb               to sVerb
+        
+        // ToDo: this redundantly duplicates the code in cRESTApiObject
+        If (bReadOnly and "POST|PATCH|DELETE" contains Uppercase(sVerb)) Begin
+            Send Unauthorized "You do not have update rights to this resource"
+            Procedure_Return
+        End
+        
+        For i from 0 to (iDepth - 1)
+            Move (RemoveFromArray(asParts, 0)) to asParts
+        Loop
+        
+        Move (SizeOfArray(asParts) - 1) to iLast
+        
+        If (Mod(iLast, 2) = 0) Begin
+            Get HandlerObject asParts[iLast] to hoHandler
+            
+            If hoHandler Begin
+                Move (IsObjectOfClass(hoHandler, ;
+                      RefClass(cRESTApiSystemObject))) to bSystem
+            
+                If (sVerb = C_httpGet) Begin
+                    Get UrlParameter "meta" to sMeta
+                    
+                    If (sMeta) ;
+                        Send Metadata of hoHandler
+                    Else ;
+                        Send List     of hoHandler
+                End
+                Else If (sVerb = C_httpPost) Begin
+                    
+                    If bSystem ;
+                        Send UnrecognisedOperation
+                    Else ;
+                        Send Create   of hoHandler
+                    
+                End
+                Else If (sVerb = C_httpPatch) Begin
+                    
+                    If bSystem ;
+                        Send Update of hoHandler
+                    Else ;
+                        Send UnrecognisedOperation
+                        
+                End
+                Else ;
+                    Send UnrecognisedOperation
+            End
+            Else ;
+                Send UnrecognisedOperation
+                
+        End
+        Else Begin
+            Get HandlerObject asParts[iLast - 1] to hoHandler
+
+            If (IsObjectOfClass(hoHandler, ;
+                RefClass(cRESTApiSystemObject))) Begin
+                Send UnrecognisedOperation
+                Procedure_Return
+            End
+            
+            Move asParts[iLast] to sInstID
+            
+            If (sVerb = C_httpGet) ;
+                Send Instance of hoHandler sInstID
+            Else If (sVerb = C_httpPatch) ;
+                Send Update   of hoHandler sInstID
+            Else If (sVerb = C_httpDelete) ;
+                Send Delete   of hoHandler sInstID
+            Else ;
+                Send UnrecognisedOperation
+            
+        End
+            
+    End_Procedure
+    
+End_Class

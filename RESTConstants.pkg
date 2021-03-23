@@ -1,0 +1,31 @@
+//==============================================================================
+// APIConstants.pkg
+// ----------------
+//
+// Constants we will use in various places while creating RESTful APIs
+//==============================================================================
+
+Define C_httpGet    for "GET"
+Define C_httpPut    for "PUT"
+Define C_httpPost   for "POST"
+Define C_httpDelete for "DELETE"
+Define C_httpPatch  for "PATCH"
+
+Enum_List
+    Define C_restModeList for 0
+    Define C_restModeInstance
+    Define C_restModeCreate
+    Define C_restModeUpdate
+    Define C_restModeDelete
+End_Enum_List
+
+Define jsonTypeOverlap for -1
+Define jsonTypeBinary  for 99
+
+Define C_authBasic for "BASIC "  // Note: the trailing space is both intentional and important.
+Define C_restDefaultLimit for 1000
+
+Struct tBasicAuthCredentials
+    String sUserName
+    String sPassword
+End_Struct

@@ -1,0 +1,15 @@
+Object oRESTApiObject is a cApiObject
+    Set phoDD       to 0
+    Set psCollName  to ""
+    Set psInstName  to ""
+    
+    // Send AddListColumn File_Field Table.Column
+    // Send AddListColumn File_Field Table.Column
+    
+    Procedure PostProc Handle hoResp Integer iMode
+        // Add dependant collections (or other links) in here, e.g.:
+        // Send AddCollection hoResp "{name}" (InstURL(Self, iMode) + "/{collectionName}")
+        // Send AddLink hoResp "{name}" {identifier} {URL}
+    End_Procedure
+
+End_Object

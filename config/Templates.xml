@@ -1,0 +1,10 @@
+<Templates>
+	<Template>
+		<ComponentType>51</ComponentType>
+		<Name>RESTful API Wizard</Name>
+		<FileName>RESTWizard.exe</FileName>
+		<ImageLarge>RESTfulAPI.ico</ImageLarge>
+		<BriefDescription>Create a RESTful API</BriefDescription>
+		<LongDescription>Allows you to creae a RESTful API for your workspace based on its Data Dictionaries.\n\nIf there are tables you wish to include in such an API (even as parents or children) which do not currently have Data Dictionaries, you should create those before running this Wizard.</LongDescription>
+	</Template>
+</Templates>

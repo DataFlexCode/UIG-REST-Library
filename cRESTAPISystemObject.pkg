@@ -1,0 +1,150 @@
+//==============================================================================
+// cRESTApiSystemObject.pkg
+// ------------------------
+// This is just a cut-down version of the oApiObject for dealing with system
+// tables (single record tables).  It basically only does Instance and Update.
+//------------------------------------------------------------------------------
+// Date         Author  Comments
+// ----------   ------  --------------------------------------------------------
+// 11/08/2020   MJP     Modified in line with refactoring of cRESTAPIObject
+// 14/12/2018   MJP     Changed class name to cRESTAPISystemObject as per 
+//                      Sture's suggestions
+// 11/10/2018   MJP     Original
+//==============================================================================
+
+Use cRESTApiObject.pkg
+
+Class cRESTApiSystemObject is a cRESTApiObject
+    
+    Function IsSystemFileObject Returns Boolean
+        Function_Return True
+    End_Function
+
+    Procedure End_Construct_Object
+        Handle  htTable
+        Boolean bSys
+        
+        Set psInstName to (psCollName(Self))
+        
+        Forward Send End_Construct_Object
+        
+        // Assertion:
+        Get Main_File of (phoDD(Self)) to htTable
+        Get_Attribute DF_FILE_IS_SYSTEM_FILE of htTable to bSys
+        
+        If not bSys Begin
+            Error 682 ("cRESTApiSystemObject" * ;
+                    Name(Self) + ;
+                     "'s Main_File is not a system table - use cRESTApiObject instead")
+        End
+        
+    End_Procedure
+    
+    // Procedure List
+    // ==============
+    // Lists a collection
+    Procedure List
+        Send Instance ""
+    End_Procedure
+    
+    // Procedure Instance
+    // ==================
+    // Returns details of an instance
+    Procedure Instance String sID
+        Integer[] aiFields
+        Handle    hoInst hoResp
+        
+        If (pbAllowFieldSelection(Self)) ;
+            Get RequestFieldsList to aiFields
+        
+        If not (SizeOfArray(aiFields)) ;
+            Get paiDefaultInstanceFields  to aiFields
+
+        Send Request_Assign of (phoDD(Self))
+        Get JsonFromDD (phoDD(Self)) aiFields to hoInst        
+        
+        Send ReturnInstance hoInst C_restModeInstance
+    End_Procedure
+    
+    // Procedure Create
+    // ================
+    // Creates an instance
+    Procedure Create
+        // Overridden to do nothing
+    End_Procedure
+    
+    // Procedure Update
+    // ================
+    // Updates an instance
+    Procedure Update String sID
+        Handle    hoJson hoResp hoInst hoDD
+        Integer[] aiFields
+        Integer   iErr
+        String    sErrMsg
+        
+        If (pbReadOnly(Self)) Begin
+            Send NotAllowed
+            Procedure_Return
+        End
+        
+        If (pbNoUpdate(Self)) Begin
+            Send NotAllowed
+            Procedure_Return
+        End
+        
+        Get phoDD to hoDD
+
+        Send Request_Assign of hoDD
+        
+        Get phoRequestJson to hoJson
+        
+        If (hoJson = -1) ;
+            Procedure_Return
+        
+        If not hoJson Begin
+            Send NoJson
+            Procedure_Return
+        End
+        
+        Send UpdateDDFromJson hoDD hoJson
+        
+        If (Should_Save(hoDD)) Begin
+            Get Request_Validate of hoDD to iErr
+            
+            If iErr Begin
+                Send UpdateError C_restModeUpdate
+                Procedure_Return
+            End
+            
+            Move (False) to Err
+            Send Request_Save of hoDD
+            
+            If (Err) Begin
+                Send UpdateError C_restModeUpdate
+                Procedure_Return
+            End
+            
+            If (pbAllowFieldSelection(Self)) ;
+                Get RequestFieldsList to aiFields
+        
+            If not (SizeOfArray(aiFields)) ;
+                Get paiDefaultInstanceFields  to aiFields
+
+            Get JsonFromDD hoDD aiFields to hoInst
+            Send ReturnInstance hoInst C_restModeUpdate
+            
+        End
+        Else Begin
+            Send NothingToUpdate
+        End
+        
+    End_Procedure
+    
+    // Procedure Delete
+    // ================
+    // Deletes an instance
+    Procedure Delete String sID
+        // Overridden to do nothing
+    End_Procedure
+    
+End_Class
